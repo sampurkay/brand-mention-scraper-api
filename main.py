@@ -1,22 +1,33 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from contextlib import asynccontextmanager
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-from models import (
+from app.models import (
     ScrapeRequest,
     ScrapeResponse,
     UrlResult,
     ScrapeSummary,
     SummaryItem,
 )
-from scraper import PoliteScraper, CrawlParams, PageResult
-from matching import find_matches_in_text
+from app.scraper import PoliteScraper, CrawlParams
+from app.matching import find_matches_in_text
 
-app = FastAPI()
+
+# Global scraper instance (closed via lifespan)
 scraper = PoliteScraper()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    await scraper.aclose()
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 # -----------------------
@@ -59,73 +70,12 @@ class JobCancelResponse(BaseModel):
 
 
 # -----------------------
-# Utility: build summary
-# -----------------------
-
-def _summarize_results(
-    url_results: List[UrlResult],
-    payload: ScrapeRequest,
-) -> ScrapeSummary:
-    # brand -> product -> {"mentions": int, "urls": int}
-    summary: dict[str, dict[str, dict[str, int]]] = {b.name: {} for b in payload.brands}
-    url_sets: dict[tuple[str, str], set[str]] = {}
-
-    for r in url_results:
-        if not r.status.startswith("ok"):
-            continue
-
-        # Find matches in this page text by re-running matcher on response snippets
-        # (We do this here because crawl jobs store text; main endpoint can also compute inline.)
-        matches = find_matches_in_text(
-            text=" ".join(
-                ms.text_snippet for pm in r.product_mentions for ms in pm.matches
-            ) if r.product_mentions else "",
-            brands=payload.brands,
-            options=payload.options,
-        )
-
-        # NOTE: If you want to avoid re-matching, use /api/jobs/.../summary endpoint below,
-        # which computes directly from stored PageResult.text without truncation.
-        for m in matches:
-            brand_key: str = m.brand
-            product_key: str = m.product or "_brand_only"
-
-            summary.setdefault(brand_key, {})
-            summary[brand_key].setdefault(product_key, {"mentions": 0, "urls": 0})
-            summary[brand_key][product_key]["mentions"] += int(m.count)
-
-            pair = (brand_key, product_key)
-            url_sets.setdefault(pair, set())
-            if str(r.url) not in url_sets[pair]:
-                summary[brand_key][product_key]["urls"] += 1
-                url_sets[pair].add(str(r.url))
-
-    items: list[SummaryItem] = []
-    for brand_key, pdata in summary.items():
-        for product_key, stats in pdata.items():
-            items.append(
-                SummaryItem(
-                    brand=brand_key,
-                    product=None if product_key == "_brand_only" else product_key,
-                    total_mentions=stats["mentions"],
-                    urls_with_mentions=stats["urls"],
-                )
-            )
-    return ScrapeSummary(total_urls=len(url_results), items=items)
-
-
-# -----------------------
 # Basic endpoints
 # -----------------------
 
 @app.get("/")
 def home() -> Dict[str, str]:
-    return {"status": "ok", "message": "Scraper API running on Replit"}
-
-
-@app.on_event("shutdown")
-async def _shutdown() -> None:
-    await scraper.aclose()
+    return {"status": "ok", "message": "Scraper API running"}
 
 
 # --------------------------------------------------------------------
@@ -137,10 +87,8 @@ async def scrape(payload: ScrapeRequest) -> ScrapeResponse:
     """
     Single-shot scrape (can time out for deep crawls / JS sites).
     Prefer the async-first job endpoints below for GPT Actions.
-
-    This endpoint remains useful for quick manual testing.
     """
-    results: list[UrlResult] = []
+    results: List[UrlResult] = []
     summary: dict[str, dict[str, dict[str, int]]] = {b.name: {} for b in payload.brands}
     url_sets: dict[tuple[str, str], set[str]] = {}
 
@@ -165,10 +113,14 @@ async def scrape(payload: ScrapeRequest) -> ScrapeResponse:
 
         for page_url_str, status, _title, text in pages:
             if not status.startswith("ok"):
-                results.append(UrlResult(url=page_url_str, status=status, product_mentions=[]))
+                results.append(
+                    UrlResult(url=page_url_str, status=status, product_mentions=[])
+                )
                 continue
 
-            matches = find_matches_in_text(text=text, brands=payload.brands, options=payload.options)
+            matches = find_matches_in_text(
+                text=text, brands=payload.brands, options=payload.options
+            )
 
             for m in matches:
                 brand_key: str = m.brand
@@ -184,9 +136,11 @@ async def scrape(payload: ScrapeRequest) -> ScrapeResponse:
                     summary[brand_key][product_key]["urls"] += 1
                     url_sets[pair].add(page_url_str)
 
-            results.append(UrlResult(url=page_url_str, status=status, product_mentions=matches))
+            results.append(
+                UrlResult(url=page_url_str, status=status, product_mentions=matches)
+            )
 
-    summary_items: list[SummaryItem] = []
+    summary_items: List[SummaryItem] = []
     for brand_key, pdata in summary.items():
         for product_key, stats in pdata.items():
             summary_items.append(
@@ -272,38 +226,46 @@ async def job_results(
         results=url_results,
     )
 
+
 @app.post("/api/jobs/{job_id}/summary", response_model=JobSummaryResponse)
 async def job_summary(job_id: str, payload: ScrapeRequest) -> JobSummaryResponse:
     """
     Compute mention summary for a completed or running job using the same matching rules
-    as the single-shot endpoint. This keeps the job storage minimal while letting
-    GPT Actions fetch the final structured summary in a small response.
+    as the single-shot endpoint.
     """
     stored = await scraper.get_job_results(job_id, offset=0, limit=10_000)
     if stored is None:
         raise HTTPException(status_code=404, detail="job_id not found")
 
-    # Build UrlResult list with real matches
     url_results: List[UrlResult] = []
     for pr in stored:
         if not pr.status.startswith("ok"):
-            url_results.append(UrlResult(url=pr.url, status=pr.status, product_mentions=[]))
+            url_results.append(
+                UrlResult(url=pr.url, status=pr.status, product_mentions=[])
+            )
             continue
-        matches = find_matches_in_text(text=pr.text, brands=payload.brands, options=payload.options)
-        url_results.append(UrlResult(url=pr.url, status=pr.status, product_mentions=matches))
+
+        matches = find_matches_in_text(
+            text=pr.text, brands=payload.brands, options=payload.options
+        )
+        url_results.append(
+            UrlResult(url=pr.url, status=pr.status, product_mentions=matches)
+        )
 
     summary = _summarize_url_results(url_results, payload)
-
     return JobSummaryResponse(job_id=job_id, summary=summary)
 
 
-def _summarize_url_results(url_results: List[UrlResult], payload: ScrapeRequest) -> ScrapeSummary:
+def _summarize_url_results(
+    url_results: List[UrlResult], payload: ScrapeRequest
+) -> ScrapeSummary:
     summary: dict[str, dict[str, dict[str, int]]] = {b.name: {} for b in payload.brands}
     url_sets: dict[tuple[str, str], set[str]] = {}
 
     for r in url_results:
         if not r.status.startswith("ok"):
             continue
+
         for pm in r.product_mentions:
             brand_key = pm.brand
             product_key = pm.product or "_brand_only"
@@ -318,7 +280,7 @@ def _summarize_url_results(url_results: List[UrlResult], payload: ScrapeRequest)
                 summary[brand_key][product_key]["urls"] += 1
                 url_sets[pair].add(str(r.url))
 
-    items: list[SummaryItem] = []
+    items: List[SummaryItem] = []
     for brand_key, pdata in summary.items():
         for product_key, stats in pdata.items():
             items.append(
@@ -329,4 +291,5 @@ def _summarize_url_results(url_results: List[UrlResult], payload: ScrapeRequest)
                     urls_with_mentions=stats["urls"],
                 )
             )
+
     return ScrapeSummary(total_urls=len(url_results), items=items)
