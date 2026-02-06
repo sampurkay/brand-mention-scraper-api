@@ -1,0 +1,528 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Brand & Product Mention Scraper",
+    "version": "1.1.0",
+    "description": "Scrapes specified URLs (optionally with JS rendering and deep crawling) to find mentions of multiple brands and products. Includes async-first job endpoints to avoid long-running requests/timeouts."
+  },
+  "servers": [
+    {
+      "url": "https://YOUR-REPL-URL"
+    }
+  ],
+  "paths": {
+    "/": {
+      "get": {
+        "operationId": "home",
+        "summary": "Health check",
+        "responses": {
+          "200": {
+            "description": "API status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": { "type": "string" },
+                    "message": { "type": "string" }
+                  },
+                  "required": ["status", "message"],
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "/api/scrape-product-mentions": {
+      "post": {
+        "operationId": "scrapeBrandProductMentions",
+        "summary": "Single-shot scrape (may time out for deep crawls / JS sites). Prefer job endpoints for GPT Actions.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ScrapeRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Scrape results",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ScrapeResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "/api/jobs": {
+      "post": {
+        "operationId": "createScrapeJob",
+        "summary": "Create an async scrape job (Action-friendly). Returns a job_id immediately.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ScrapeRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Job created",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/JobSubmitResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "/api/jobs/{job_id}": {
+      "get": {
+        "operationId": "getScrapeJobStatus",
+        "summary": "Get status/progress for a job_id",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Job status",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/JobStatusResponse" }
+              }
+            }
+          },
+          "404": {
+            "description": "Job not found"
+          }
+        }
+      }
+    },
+
+    "/api/jobs/{job_id}/cancel": {
+      "post": {
+        "operationId": "cancelScrapeJob",
+        "summary": "Cancel a running/queued job",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cancel requested",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/JobCancelResponse" }
+              }
+            }
+          },
+          "404": {
+            "description": "Job not found"
+          }
+        }
+      }
+    },
+
+    "/api/jobs/{job_id}/results": {
+      "get": {
+        "operationId": "getScrapeJobResults",
+        "summary": "Get job crawl results (paged). Returns URLs/status; mentions may be empty to keep payload small.",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 0, "default": 0 }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paged job results",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/JobResultsResponse" }
+              }
+            }
+          },
+          "404": {
+            "description": "Job not found"
+          }
+        }
+      }
+    },
+
+    "/api/jobs/{job_id}/summary": {
+      "post": {
+        "operationId": "getScrapeJobSummary",
+        "summary": "Compute brand/product mention summary for a job using provided matching rules (brands/options).",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ScrapeRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Job summary",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/JobSummaryResponse" }
+              }
+            }
+          },
+          "404": {
+            "description": "Job not found"
+          }
+        }
+      }
+    }
+  },
+
+  "components": {
+    "schemas": {
+      "Product": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "aliases": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": []
+          },
+          "skus": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": []
+          }
+        },
+        "required": ["name"],
+        "additionalProperties": false
+      },
+
+      "Brand": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "aliases": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": []
+          },
+          "products": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Product" },
+            "default": []
+          }
+        },
+        "required": ["name", "aliases", "products"],
+        "additionalProperties": false
+      },
+
+      "ScrapeOptions": {
+        "type": "object",
+        "properties": {
+          "context_chars": {
+            "type": "integer",
+            "default": 200,
+            "minimum": 0,
+            "maximum": 5000
+          }
+        },
+        "required": ["context_chars"],
+        "additionalProperties": false
+      },
+
+      "ScrapeRequest": {
+        "type": "object",
+        "properties": {
+          "urls": {
+            "type": "array",
+            "items": { "type": "string", "format": "uri" }
+          },
+          "brands": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Brand" }
+          },
+          "options": {
+            "$ref": "#/components/schemas/ScrapeOptions",
+            "default": { "context_chars": 200 }
+          },
+
+          "crawl_depth": {
+            "type": "integer",
+            "default": 0,
+            "minimum": 0,
+            "maximum": 10,
+            "description": "BFS crawl depth from each seed URL (0 = only seed page)."
+          },
+          "max_pages": {
+            "type": "integer",
+            "default": 30,
+            "minimum": 1,
+            "maximum": 2000,
+            "description": "Max pages to fetch per seed URL."
+          },
+          "same_domain_only": {
+            "type": "boolean",
+            "default": true,
+            "description": "Restrict crawling to the same domain as the seed URL."
+          },
+
+          "include_link_keywords": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": [],
+            "description": "If provided, only follow links whose URL contains any of these keywords."
+          },
+          "include_url_patterns": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": [],
+            "description": "If provided, only URLs matching at least one regex will be crawled."
+          },
+          "exclude_url_patterns": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": [],
+            "description": "URLs matching any regex will be skipped."
+          },
+
+          "render_js": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enable Playwright rendering for JS-heavy pages."
+          },
+          "js_only": {
+            "type": "boolean",
+            "default": false,
+            "description": "If true and render_js=true, always use Playwright (not just fallback)."
+          },
+          "wait_until": {
+            "type": "string",
+            "default": "networkidle",
+            "enum": ["domcontentloaded", "networkidle"],
+            "description": "Playwright navigation wait condition."
+          },
+          "wait_ms": {
+            "type": "integer",
+            "default": 0,
+            "minimum": 0,
+            "maximum": 30000,
+            "description": "Extra milliseconds to wait after navigation."
+          },
+
+          "max_concurrency": {
+            "type": "integer",
+            "default": 2,
+            "minimum": 1,
+            "maximum": 10,
+            "description": "Max concurrent fetches during crawling. Keep low for JS rendering."
+          },
+          "respect_robots": {
+            "type": "boolean",
+            "default": true,
+            "description": "If false, skip robots.txt checks (not recommended)."
+          }
+        },
+        "required": ["urls", "brands"],
+        "additionalProperties": false
+      },
+
+      "MatchSnippet": {
+        "type": "object",
+        "properties": {
+          "brand": { "type": "string" },
+          "product": { "type": ["string", "null"], "default": null },
+          "matched_term": { "type": "string" },
+          "text_snippet": { "type": "string" }
+        },
+        "required": ["brand", "matched_term", "text_snippet"],
+        "additionalProperties": false
+      },
+
+      "ProductMatch": {
+        "type": "object",
+        "properties": {
+          "brand": { "type": "string" },
+          "product": { "type": ["string", "null"], "default": null },
+          "count": { "type": "integer" },
+          "matches": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/MatchSnippet" }
+          }
+        },
+        "required": ["brand", "count", "matches"],
+        "additionalProperties": false
+      },
+
+      "UrlResult": {
+        "type": "object",
+        "properties": {
+          "url": { "type": "string" },
+          "status": { "type": "string" },
+          "product_mentions": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/ProductMatch" }
+          }
+        },
+        "required": ["url", "status", "product_mentions"],
+        "additionalProperties": false
+      },
+
+      "SummaryItem": {
+        "type": "object",
+        "properties": {
+          "brand": { "type": "string" },
+          "product": { "type": ["string", "null"], "default": null },
+          "total_mentions": { "type": "integer" },
+          "urls_with_mentions": { "type": "integer" }
+        },
+        "required": ["brand", "total_mentions", "urls_with_mentions"],
+        "additionalProperties": false
+      },
+
+      "ScrapeSummary": {
+        "type": "object",
+        "properties": {
+          "total_urls": { "type": "integer" },
+          "items": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/SummaryItem" }
+          }
+        },
+        "required": ["total_urls", "items"],
+        "additionalProperties": false
+      },
+
+      "ScrapeResponse": {
+        "type": "object",
+        "properties": {
+          "summary": { "$ref": "#/components/schemas/ScrapeSummary" },
+          "results_by_url": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/UrlResult" }
+          }
+        },
+        "required": ["summary", "results_by_url"],
+        "additionalProperties": false
+      },
+
+      "JobSubmitResponse": {
+        "type": "object",
+        "properties": {
+          "job_id": { "type": "string" }
+        },
+        "required": ["job_id"],
+        "additionalProperties": false
+      },
+
+      "JobStatusResponse": {
+        "type": "object",
+        "properties": {
+          "job_id": { "type": "string" },
+          "status": {
+            "type": "string",
+            "description": "queued | running | done | error | cancelled"
+          },
+          "created_at": { "type": "number" },
+          "updated_at": { "type": "number" },
+          "error": { "type": ["string", "null"], "default": null },
+          "seeds_total": { "type": "integer" },
+          "seeds_done": { "type": "integer" },
+          "pages_attempted": { "type": "integer" },
+          "pages_stored": { "type": "integer" },
+          "max_pages_stored": { "type": "integer" }
+        },
+        "required": [
+          "job_id",
+          "status",
+          "created_at",
+          "updated_at",
+          "seeds_total",
+          "seeds_done",
+          "pages_attempted",
+          "pages_stored",
+          "max_pages_stored"
+        ],
+        "additionalProperties": false
+      },
+
+      "JobCancelResponse": {
+        "type": "object",
+        "properties": {
+          "job_id": { "type": "string" },
+          "cancelled": { "type": "boolean" }
+        },
+        "required": ["job_id", "cancelled"],
+        "additionalProperties": false
+      },
+
+      "JobResultsResponse": {
+        "type": "object",
+        "properties": {
+          "job_id": { "type": "string" },
+          "offset": { "type": "integer" },
+          "limit": { "type": "integer" },
+          "total_returned": { "type": "integer" },
+          "results": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/UrlResult" }
+          }
+        },
+        "required": ["job_id", "offset", "limit", "total_returned", "results"],
+        "additionalProperties": false
+      },
+
+      "JobSummaryResponse": {
+        "type": "object",
+        "properties": {
+          "job_id": { "type": "string" },
+          "summary": { "$ref": "#/components/schemas/ScrapeSummary" }
+        },
+        "required": ["job_id", "summary"],
+        "additionalProperties": false
+      }
+    }
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "urls": [
+    "https://www.hemequity.com/"
+  ],
+  "brands": [
+    {
+      "name": "Ferinject",
+      "aliases": ["ferric carboxymaltose"],
+      "products": []
+    },
+    { "name": "Monoferric", "aliases": [], "products": [] },
+    { "name": "Injectafer", "aliases": [], "products": [] },
+    { "name": "Venofer", "aliases": [], "products": [] },
+    { "name": "Feraheme", "aliases": [], "products": [] }
+  ],
+  "options": {
+    "context_chars": 200
+  },
+
+  "crawl_depth": 6,
+  "max_pages": 2000,
+  "same_domain_only": true,
+
+  "include_link_keywords": [],
+
+  "include_url_patterns": [
+    "^https://www\\.hemequity\\.com/?$",
+    "^https://www\\.hemequity\\.com/(fr|es|ar)/.*$",
+    "^https://www\\.hemequity\\.com/raise-the-bar-[a-z0-9-]+/?$",
+    "^https://www\\.hemequity\\.com/hmb([-/][a-z0-9-]+)?/?$",
+    "^https://www\\.hemequity\\.com/iron-education-[a-z0-9-]+/?$",
+    "^https://www\\.hemequity\\.com/take-control-period-[a-z0-9-]+/?$",
+    "^https://www\\.hemequity\\.com/(journal-publications|poster-publications|copy-of-poster-presentations)/?$",
+    "^https://www\\.hemequity\\.com/(our-resources-for-healthcare-providers|our-resources-for-patients)/?$",
+    "^https://www\\.hemequity\\.com/(get-involved|our-team|our-partners|coagwiz|toronto-iv-iron-policy)/?$"
+  ],
+  "exclude_url_patterns": [
+    "\\.(jpg|jpeg|png|gif|svg|webp|ico|pdf|doc|docx|ppt|pptx|xls|xlsx|zip|rar|7z|mp4|mp3|wav|csv|json|xml|txt)(\\?.*)?$",
+    "/(?:_next|static|assets|images|img|fonts|uploads|media)/",
+    "/(?:api|cdn-cgi)/",
+    "surveymonkey\\.com"
+  ],
+
+  "render_js": true,
+  "js_only": true,
+  "wait_until": "domcontentloaded",
+  "wait_ms": 4500,
+
+  "max_concurrency": 2,
+  "respect_robots": true
+}
