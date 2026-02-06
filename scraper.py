@@ -1,46 +1,41 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import re
 import time
 import urllib.parse
 import uuid
-from collections import deque
 from dataclasses import dataclass, field
-from typing import (
-    Any,
-    Deque,
-    Dict,
-    Iterable,
-    List,
-    Optional,
-    Pattern,
-    Set,
-    Tuple,
-    Union,
-    TYPE_CHECKING,
-)
+from typing import Any, AsyncGenerator, Deque, Dict, Iterable, List, Optional, Pattern, Set, Tuple
+from collections import deque
 
 import httpx
 from bs4 import BeautifulSoup
 from urllib.robotparser import RobotFileParser
 
-# Playwright is optional. We import lazily at runtime when render_js is enabled.
+# Playwright is optional; imported lazily when render_js=True
+from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from playwright.async_api import Browser, Playwright  # type: ignore
+    from playwright.async_api import Browser, BrowserContext, Page, Playwright, Response  # type: ignore
 
 
-DEFAULT_DELAY: float = 1.0  # seconds per domain
-DEFAULT_TIMEOUT: float = 12.0
+# -----------------------------
+# Tunables / defaults
+# -----------------------------
+
+DEFAULT_TIMEOUT_S: float = 20.0
+DEFAULT_CONNECT_TIMEOUT_S: float = 10.0
+DEFAULT_READ_TIMEOUT_S: float = 20.0
+
+DEFAULT_DELAY_PER_DOMAIN_S: float = 1.0   # politeness
 MAX_TEXT_CHARS: int = 200_000
 
-# ---- Async-first job defaults ----
 DEFAULT_WORKERS: int = 2
-DEFAULT_JOB_TTL_SECONDS: int = 60 * 60  # 1 hour
+DEFAULT_JOB_TTL_SECONDS: int = 60 * 60
 DEFAULT_MAX_PAGES_STORED_PER_JOB: int = 2000
 DEFAULT_EVENT_QUEUE_SIZE: int = 1000
 
-# Heuristics to detect blocks / bot walls (not exhaustive)
+# Detection heuristics
 _BLOCK_MARKERS = (
     "captcha",
     "cloudflare",
@@ -51,178 +46,24 @@ _BLOCK_MARKERS = (
     "verify you are human",
 )
 
-# Heuristics to detect JS-shell pages that often need rendering
 _JS_SHELL_MARKERS = (
     "__NEXT_DATA__",
-    "id=\"__next\"",
+    'id="__next"',
     "data-reactroot",
     "ng-version",
-    "id=\"app\"",
+    'id="app"',
 )
 
-# Skip common non-content file types during crawling
 _SKIP_EXTENSIONS = (
-    ".pdf",
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".gif",
-    ".webp",
-    ".svg",
-    ".zip",
-    ".rar",
-    ".7z",
-    ".tar",
-    ".gz",
-    ".mp4",
-    ".mov",
-    ".avi",
-    ".mp3",
-    ".wav",
-    ".css",
-    ".js",
-    ".xml",
+    ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg",
+    ".zip", ".rar", ".7z", ".tar", ".gz",
+    ".mp4", ".mov", ".avi", ".mp3", ".wav",
+    ".css", ".js", ".xml",
 )
-
-
-def _normalize_url(url: str) -> str:
-    """Normalize URL for dedupe (strip fragment, normalize scheme/host)."""
-    parsed = urllib.parse.urlparse(url)
-    scheme = parsed.scheme or "https"
-    netloc = parsed.netloc.lower()
-    path = parsed.path or "/"
-    query = parsed.query
-    return urllib.parse.urlunparse((scheme, netloc, path, "", query, ""))
-
-
-def _same_domain(a: str, b: str) -> bool:
-    return urllib.parse.urlparse(a).netloc.lower() == urllib.parse.urlparse(b).netloc.lower()
-
-
-def _looks_blocked(status_code: int, body_text: str) -> bool:
-    if status_code in (401, 403, 429):
-        return True
-    lower = (body_text or "").lower()
-    return any(m in lower for m in _BLOCK_MARKERS)
-
-
-def _looks_js_shell(html: str) -> bool:
-    if not html:
-        return True
-    if len(html) < 1200:
-        return True
-    lower = html.lower()
-    return any(m.lower() in lower for m in _JS_SHELL_MARKERS)
-
-
-def _extract_title(soup: BeautifulSoup) -> str:
-    title_tag = soup.find("title")
-    return title_tag.get_text(strip=True) if title_tag else ""
-
-
-def _html_to_text(soup: BeautifulSoup) -> str:
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-    return soup.get_text(" ", strip=True)
-
-
-def _is_likely_html(content_type: str) -> bool:
-    return "text/html" in (content_type or "").lower()
-
-
-def _is_likely_json(content_type: str) -> bool:
-    ct = (content_type or "").lower()
-    return "application/json" in ct or ct.endswith("+json")
-
-
-def _json_to_text(payload: object, max_chars: int = MAX_TEXT_CHARS) -> str:
-    strings: List[str] = []
-
-    def walk(x: object) -> None:
-        if x is None:
-            return
-        if isinstance(x, str):
-            if x.strip():
-                strings.append(x.strip())
-            return
-        if isinstance(x, (int, float, bool)):
-            return
-        if isinstance(x, list):
-            for i in x:
-                walk(i)
-            return
-        if isinstance(x, dict):
-            for v in x.values():
-                walk(v)
-            return
-
-    walk(payload)
-    joined = " ".join(strings)
-    if joined:
-        return joined[:max_chars]
-    try:
-        s = json.dumps(payload, ensure_ascii=False, indent=2)
-    except Exception:
-        s = str(payload)
-    return s[:max_chars]
-
-
-def _attr_to_str(val: object) -> str:
-    if val is None:
-        return ""
-    if isinstance(val, str):
-        return val
-    if isinstance(val, (list, tuple)):
-        parts = [p for p in val if isinstance(p, str)]
-        return " ".join(parts)
-    return str(val)
-
-
-def _extract_links(base_url: str, soup: BeautifulSoup, same_domain_only: bool) -> List[str]:
-    links: List[str] = []
-    for a in soup.find_all("a", href=True):
-        href = _attr_to_str(a.get("href")).strip()
-        if not href:
-            continue
-        if href.startswith(("mailto:", "tel:", "javascript:")):
-            continue
-        abs_url = _normalize_url(urllib.parse.urljoin(base_url, href))
-        if same_domain_only and not _same_domain(abs_url, base_url):
-            continue
-        links.append(abs_url)
-    return links
-
-
-def _compile_patterns(patterns: Optional[List[str]]) -> List[Pattern[str]]:
-    import re
-
-    compiled: List[Pattern[str]] = []
-    for p in patterns or []:
-        p = (p or "").strip()
-        if not p:
-            continue
-        try:
-            compiled.append(re.compile(p, flags=re.IGNORECASE))
-        except Exception:
-            continue
-    return compiled
-
-
-def _matches_any(url: str, patterns: List[Pattern[str]]) -> bool:
-    return any(p.search(url) is not None for p in patterns)
-
-
-def _is_skippable_url(url: str) -> bool:
-    lower = url.lower()
-    if lower.endswith(_SKIP_EXTENSIONS):
-        return True
-    if lower.startswith(("mailto:", "tel:", "javascript:")):
-        return True
-    return False
 
 
 # -----------------------------
-# Async-first job infrastructure
+# Data models
 # -----------------------------
 
 @dataclass
@@ -235,7 +76,7 @@ class CrawlParams:
 
     render_js: bool = False
     js_only: bool = False
-    wait_until: str = "networkidle"
+    wait_until: str = "networkidle"  # "load" | "domcontentloaded" | "networkidle"
     wait_ms: int = 0
 
     same_domain_only: bool = True
@@ -260,113 +101,755 @@ class JobRecord:
     params: CrawlParams
     seed_urls: List[str]
 
-    # progress
     pages_stored: int = 0
     pages_attempted: int = 0
     seeds_total: int = 0
     seeds_done: int = 0
 
-    # storage (bounded)
     results: List[PageResult] = field(default_factory=list)
-
-    # error
     error: Optional[str] = None
 
-    # cancellation
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
-
-    # progress events
     events: asyncio.Queue[dict] = field(default_factory=lambda: asyncio.Queue(maxsize=DEFAULT_EVENT_QUEUE_SIZE))
 
 
+# -----------------------------
+# Utilities
+# -----------------------------
+
+def _normalize_url(url: str) -> str:
+    """Normalize URL for dedupe: strip fragment; normalize scheme/host."""
+    parsed = urllib.parse.urlparse(url)
+    scheme = parsed.scheme or "https"
+    netloc = parsed.netloc.lower()
+    path = parsed.path or "/"
+    query = parsed.query
+    return urllib.parse.urlunparse((scheme, netloc, path, "", query, ""))
+
+
+def _domain(url: str) -> str:
+    return urllib.parse.urlparse(url).netloc.lower()
+
+
+def _same_domain(a: str, b: str) -> bool:
+    return _domain(a) == _domain(b)
+
+
+def _looks_like_block(text: str) -> bool:
+    t = (text or "").lower()
+    return any(m in t for m in _BLOCK_MARKERS)
+
+
+def _looks_like_js_shell(html: str) -> bool:
+    h = html or ""
+    return any(m in h for m in _JS_SHELL_MARKERS)
+
+
+def _should_skip_url(url: str) -> bool:
+    p = urllib.parse.urlparse(url)
+    path = (p.path or "").lower()
+    return any(path.endswith(ext) for ext in _SKIP_EXTENSIONS)
+
+
+def _compile_patterns(patterns: List[str]) -> List[Pattern[str]]:
+    out: List[Pattern[str]] = []
+    for p in patterns:
+        try:
+            out.append(re.compile(p, re.IGNORECASE))
+        except re.error:
+            # ignore invalid patterns
+            continue
+    return out
+
+
+def _match_any(patterns: List[Pattern[str]], text: str) -> bool:
+    return any(p.search(text) is not None for p in patterns)
+
+
+def _extract_title_and_text_from_html(html: str) -> Tuple[str, str]:
+    soup = BeautifulSoup(html or "", "lxml")
+    title = (soup.title.string.strip() if soup.title and soup.title.string else "").strip()
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    text = soup.get_text(" ", strip=True)
+    if len(text) > MAX_TEXT_CHARS:
+        text = text[:MAX_TEXT_CHARS]
+    return title, text
+
+
+def _pick_wait_selector(html: str) -> Optional[str]:
+    """
+    Heuristic selector to wait for on JS-heavy sites so we don't snapshot too early.
+    We avoid being overly specific; prefer semantic containers.
+    """
+    # If it's clearly a JS shell, wait for common content roots.
+    if _looks_like_js_shell(html):
+        return "main, article, [role='main'], #app, #__next, body"
+    return None
+
+
+def _exp_backoff(base_delay: float, attempt: int) -> float:
+    # wait_time = base_delay * (2 ** attempt)
+    return base_delay * (2 ** attempt)
+
+
+# -----------------------------
+# PoliteScraper
+# -----------------------------
+
 class PoliteScraper:
     """
-    Keeps your original crawl/fetch behavior, and adds:
-      - submit_crawl_job(...) -> job_id (returns immediately)
-      - get_job_status(job_id) -> dict
-      - get_job_results(job_id, offset, limit) -> List[PageResult]
-      - cancel_job(job_id)
-      - stream_job_events(job_id) -> async generator of progress events
-
-    This enables an async-first architecture where GPT Actions can:
-      1) submit job
-      2) poll status
-      3) fetch results in pages
+    Polite crawler + optional Playwright rendering + async job management.
+    Public API used by main.py:
+      - crawl_relevant(...)
+      - submit_crawl_job(...)
+      - get_job_status(...)
+      - get_job_results(...)
+      - cancel_job(...)
+      - aclose()
     """
 
     def __init__(
         self,
-        user_agent: str = "ReplitScraperBot/1.0",
+        user_agent: str = "brand-mention-scraper-api/1.0 (internal)",
         *,
-        default_timeout: float = DEFAULT_TIMEOUT,
+        default_timeout: float = DEFAULT_TIMEOUT_S,
         job_workers: int = DEFAULT_WORKERS,
         job_ttl_seconds: int = DEFAULT_JOB_TTL_SECONDS,
         max_pages_stored_per_job: int = DEFAULT_MAX_PAGES_STORED_PER_JOB,
     ) -> None:
         self.user_agent = user_agent
-        self.default_timeout = default_timeout
+        self.default_timeout = float(default_timeout)
 
-        self.domain_rules: Dict[str, RobotFileParser] = {}
-        self.last_access: Dict[str, float] = {}
-        self.crawl_delay: Dict[str, float] = {}
-
-        self._client: httpx.AsyncClient = httpx.AsyncClient(
+        self._client = httpx.AsyncClient(
             headers={"User-Agent": self.user_agent},
+            timeout=httpx.Timeout(
+                timeout=self.default_timeout,
+                connect=DEFAULT_CONNECT_TIMEOUT_S,
+                read=DEFAULT_READ_TIMEOUT_S,
+            ),
             follow_redirects=True,
         )
 
-        # Playwright (lazy)
+        # robots cache per domain
+        self._robots: Dict[str, RobotFileParser] = {}
+        self._robots_lock = asyncio.Lock()
+
+        # per-domain rate limiting
+        self._domain_next_ok: Dict[str, float] = {}
+        self._domain_lock = asyncio.Lock()
+
+        # Playwright resources (lazy)
         self._pw: Optional["Playwright"] = None
         self._browser: Optional["Browser"] = None
         self._pw_lock = asyncio.Lock()
 
-        # Job infra
+        # Jobs
         self._jobs: Dict[str, JobRecord] = {}
-        self._job_lock = asyncio.Lock()
+        self._jobs_lock = asyncio.Lock()
         self._job_queue: asyncio.Queue[str] = asyncio.Queue()
-        self._workers_started = False
-        self._worker_tasks: List[asyncio.Task[None]] = []
-        self._job_workers = max(1, int(job_workers))
+        self._job_workers: List[asyncio.Task] = []
         self._job_ttl_seconds = int(job_ttl_seconds)
         self._max_pages_stored_per_job = int(max_pages_stored_per_job)
 
-    # -----------------
-    # Job public methods
-    # -----------------
+        for _ in range(int(job_workers)):
+            self._job_workers.append(asyncio.create_task(self._job_worker_loop()))
+
+        # Cleanup loop
+        self._cleanup_task = asyncio.create_task(self._cleanup_jobs_loop())
+
+    async def aclose(self) -> None:
+        # stop workers
+        for t in self._job_workers:
+            t.cancel()
+        self._cleanup_task.cancel()
+
+        await self._client.aclose()
+        await self._close_playwright()
+
+    # -----------------------------
+    # Robots / politeness
+    # -----------------------------
+
+    async def _ensure_robots(self, url: str) -> Optional[RobotFileParser]:
+        dom = _domain(url)
+        async with self._robots_lock:
+            if dom in self._robots:
+                return self._robots[dom]
+
+            rp = RobotFileParser()
+            robots_url = urllib.parse.urlunparse(("https", dom, "/robots.txt", "", "", ""))
+            try:
+                r = await self._client.get(robots_url)
+                if r.status_code >= 400:
+                    rp.parse([])
+                else:
+                    rp.parse(r.text.splitlines())
+            except Exception:
+                rp.parse([])
+
+            self._robots[dom] = rp
+            return rp
+
+    async def _polite_wait(self, url: str) -> None:
+        dom = _domain(url)
+        async with self._domain_lock:
+            now = time.time()
+            next_ok = self._domain_next_ok.get(dom, 0.0)
+            sleep_for = max(0.0, next_ok - now)
+            self._domain_next_ok[dom] = max(next_ok, now) + DEFAULT_DELAY_PER_DOMAIN_S
+
+        if sleep_for > 0:
+            await asyncio.sleep(sleep_for)
+
+    # -----------------------------
+    # HTTP fetch (fast path)
+    # -----------------------------
+
+    async def _fetch_html_httpx(self, url: str, *, max_retries: int = 2) -> Tuple[str, str]:
+        """
+        Returns (status, html). status starts with:
+          - ok_http
+          - error_http_<code>
+          - error_http_timeout
+          - error_http
+        """
+        for attempt in range(max_retries + 1):
+            try:
+                await self._polite_wait(url)
+                resp = await self._client.get(url)
+                if resp.status_code >= 400:
+                    return (f"error_http_{resp.status_code}", "")
+                ctype = (resp.headers.get("content-type") or "").lower()
+                if "text/html" not in ctype and "application/xhtml+xml" not in ctype:
+                    # still try; some sites lie
+                    pass
+                html = resp.text or ""
+                return ("ok_http", html)
+            except httpx.TimeoutException:
+                if attempt < max_retries:
+                    await asyncio.sleep(_exp_backoff(0.5, attempt))
+                    continue
+                return ("error_http_timeout", "")
+            except Exception:
+                if attempt < max_retries:
+                    await asyncio.sleep(_exp_backoff(0.5, attempt))
+                    continue
+                return ("error_http", "")
+        return ("error_http", "")
+
+    # -----------------------------
+    # Playwright (JS render path)
+    # -----------------------------
+
+    async def _ensure_playwright(self) -> None:
+        async with self._pw_lock:
+            if self._pw and self._browser:
+                return
+
+            try:
+                from playwright.async_api import async_playwright  # type: ignore
+            except Exception as e:
+                raise RuntimeError(
+                    "Playwright is not installed or not available. Add 'playwright' to requirements and ensure browsers are installed."
+                ) from e
+
+            self._pw = await async_playwright().start()
+            # Chromium is the most common for scraping
+            self._browser = await self._pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+
+    async def _close_playwright(self) -> None:
+        async with self._pw_lock:
+            if self._browser:
+                try:
+                    await self._browser.close()
+                except Exception:
+                    pass
+            self._browser = None
+            if self._pw:
+                try:
+                    await self._pw.stop()
+                except Exception:
+                    pass
+            self._pw = None
+
+    async def _new_context(self) -> "BrowserContext":
+        assert self._browser is not None
+        ctx = await self._browser.new_context(
+            user_agent=self.user_agent,
+            java_script_enabled=True,
+            viewport={"width": 1365, "height": 768},
+        )
+        return ctx
+
+    async def _configure_routing(
+        self,
+        page: "Page",
+        *,
+        block_images: bool = True,
+        block_fonts: bool = True,
+        block_media: bool = True,
+        block_stylesheets: bool = False,  # optional: can break rendering on some sites
+    ) -> None:
+        async def route_handler(route, request):
+            rtype = request.resource_type
+            if block_images and rtype == "image":
+                return await route.abort()
+            if block_fonts and rtype == "font":
+                return await route.abort()
+            if block_media and rtype in ("media",):
+                return await route.abort()
+            if block_stylesheets and rtype == "stylesheet":
+                return await route.abort()
+            return await route.continue_()
+
+        await page.route("**/*", route_handler)
+
+    async def _scroll_infinite(
+        self,
+        page: "Page",
+        *,
+        max_scrolls: int = 12,
+        scroll_pause_ms: int = 600,
+        stable_rounds: int = 2,
+    ) -> None:
+        """
+        Scroll down until height stops growing for `stable_rounds` iterations or max_scrolls is hit.
+        """
+        last_h = 0
+        stable = 0
+
+        for _ in range(max_scrolls):
+            h = await page.evaluate("() => document.body.scrollHeight")
+            if h == last_h:
+                stable += 1
+                if stable >= stable_rounds:
+                    break
+            else:
+                stable = 0
+                last_h = h
+
+            await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(scroll_pause_ms)
+
+    async def _paginate_click_next(
+        self,
+        page: "Page",
+        *,
+        max_pages: int = 4,
+        wait_until: str = "networkidle",
+        next_selectors: Optional[List[str]] = None,
+    ) -> List[str]:
+        """
+        Heuristic pagination: click a "next" control a few times and collect HTML snapshots.
+        Returns list of HTML strings (including initial page already loaded).
+        """
+        snapshots: List[str] = [await page.content()]
+        selectors = next_selectors or [
+            "a[rel='next']",
+            "button:has-text('Next')",
+            "a:has-text('Next')",
+            "button:has-text('›')",
+            "a:has-text('›')",
+        ]
+
+        for _ in range(max_pages - 1):
+            clicked = False
+            for sel in selectors:
+                loc = page.locator(sel)
+                try:
+                    if await loc.count() > 0 and await loc.first.is_visible():
+                        await loc.first.click(timeout=1500)
+                        await page.wait_for_load_state(wait_until, timeout=15000)
+                        snapshots.append(await page.content())
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if not clicked:
+                break
+        return snapshots
+
+    async def _render_html_playwright(
+        self,
+        url: str,
+        *,
+        wait_until: str,
+        wait_ms: int,
+        max_retries: int = 2,
+        enable_scroll: bool = True,
+        enable_pagination: bool = False,
+    ) -> Tuple[str, str, str]:
+        """
+        Returns (status, title, text) from Playwright rendering.
+        - smart waits (selector heuristic)
+        - resource blocking
+        - optional infinite scroll
+        - optional click pagination
+        - request/response interception for debugging signals (not exposed)
+        """
+        await self._ensure_playwright()
+
+        to_ms = int(self.default_timeout * 1000)
+
+        for attempt in range(max_retries + 1):
+            ctx: Optional["BrowserContext"] = None
+            page: Optional["Page"] = None
+            try:
+                await self._polite_wait(url)
+
+                ctx = await self._new_context()
+                page = await ctx.new_page()
+
+                # Block unnecessary resources to speed up + reduce bot friction
+                await self._configure_routing(
+                    page,
+                    block_images=True,
+                    block_fonts=True,
+                    block_media=True,
+                    block_stylesheets=False,
+                )
+
+                last_main_response: Dict[str, Any] = {"status": None, "url": None, "ctype": None}
+
+                async def on_response(resp: "Response"):
+                    try:
+                        if resp.url == page.url or resp.request.is_navigation_request():
+                            last_main_response["status"] = resp.status
+                            last_main_response["url"] = resp.url
+                            last_main_response["ctype"] = (resp.headers.get("content-type") or "").lower()
+                    except Exception:
+                        pass
+
+                page.on("response", on_response)
+
+                # Navigate
+                await page.goto(url, wait_until=wait_until, timeout=to_ms)
+
+                # Extra settle time if requested
+                if wait_ms and wait_ms > 0:
+                    await page.wait_for_timeout(wait_ms)
+
+                # Smart wait: if initial HTML looks like a JS shell, wait for main containers
+                initial_html = await page.content()
+                sel = _pick_wait_selector(initial_html)
+                if sel:
+                    try:
+                        await page.wait_for_selector(sel, timeout=min(15000, to_ms))
+                    except Exception:
+                        # selector not found; proceed anyway
+                        pass
+
+                # Optional scroll for infinite pages
+                if enable_scroll:
+                    try:
+                        await self._scroll_infinite(page)
+                    except Exception:
+                        pass
+
+                # Optional pagination click to gather additional content
+                htmls: List[str]
+                if enable_pagination:
+                    try:
+                        htmls = await self._paginate_click_next(page, wait_until=wait_until)
+                    except Exception:
+                        htmls = [await page.content()]
+                else:
+                    htmls = [await page.content()]
+
+                # Faster text extraction via JS (often better than soup on dynamic sites)
+                # Fallback to HTML parsing if innerText is empty.
+                all_text_chunks: List[str] = []
+                title = ""
+                for h in htmls:
+                    # Use page-evaluated innerText only for the final state of the page
+                    # (For earlier snapshots, parse HTML.)
+                    t, txt = _extract_title_and_text_from_html(h)
+                    if not title and t:
+                        title = t
+                    if txt:
+                        all_text_chunks.append(txt)
+
+                # Try to get live innerText from current page
+                try:
+                    live_title = await page.title()
+                    live_text = await page.evaluate("() => document.body ? document.body.innerText : ''")
+                    if live_title:
+                        title = live_title
+                    if live_text and len(live_text.strip()) > 0:
+                        all_text_chunks.insert(0, live_text)
+                except Exception:
+                    pass
+
+                combined = " ".join(x.strip() for x in all_text_chunks if x).strip()
+                if len(combined) > MAX_TEXT_CHARS:
+                    combined = combined[:MAX_TEXT_CHARS]
+
+                # Block detection
+                if _looks_like_block(combined) or _looks_like_block(" ".join(htmls)[:5000]):
+                    return ("error_blocked", title, combined)
+
+                return ("ok_playwright", title, combined)
+
+            except Exception as e:
+                if attempt < max_retries:
+                    await asyncio.sleep(_exp_backoff(0.75, attempt))
+                    continue
+                return ("error_playwright", "", "")
+            finally:
+                try:
+                    if page:
+                        await page.close()
+                except Exception:
+                    pass
+                try:
+                    if ctx:
+                        await ctx.close()
+                except Exception:
+                    pass
+
+        return ("error_playwright", "", "")
+
+    # -----------------------------
+    # Crawl core
+    # -----------------------------
+
+    async def _fetch_page(
+        self,
+        url: str,
+        *,
+        render_js: bool,
+        js_only: bool,
+        wait_until: str,
+        wait_ms: int,
+    ) -> Tuple[str, str, str]:
+        """
+        Returns (status, title, text).
+        - If js_only => Playwright only
+        - Else try httpx first; if JS shell or empty or blocked and render_js enabled => Playwright
+        """
+        if js_only:
+            return await self._render_html_playwright(
+                url,
+                wait_until=wait_until,
+                wait_ms=wait_ms,
+                enable_scroll=True,
+                enable_pagination=False,
+            )
+
+        st_http, html = await self._fetch_html_httpx(url)
+        if st_http.startswith("ok"):
+            title, text = _extract_title_and_text_from_html(html)
+
+            # If render_js, only escalate to Playwright when it looks like a shell/empty/blocked
+            if render_js:
+                if not text or _looks_like_js_shell(html) or _looks_like_block(text):
+                    st_pw, title_pw, text_pw = await self._render_html_playwright(
+                        url,
+                        wait_until=wait_until,
+                        wait_ms=wait_ms,
+                        enable_scroll=True,
+                        enable_pagination=False,
+                    )
+                    if st_pw.startswith("ok") and text_pw:
+                        return (st_pw, title_pw, text_pw)
+
+            if _looks_like_block(text):
+                return ("error_blocked", title, text)
+            return ("ok_http", title, text)
+
+        # HTTP failed; optionally fallback to Playwright
+        if render_js:
+            return await self._render_html_playwright(
+                url,
+                wait_until=wait_until,
+                wait_ms=wait_ms,
+                enable_scroll=True,
+                enable_pagination=False,
+            )
+
+        return (st_http, "", "")
+
+    def _extract_links(self, base_url: str, html: str) -> List[str]:
+        soup = BeautifulSoup(html or "", "lxml")
+        links: List[str] = []
+        for a in soup.find_all("a", href=True):
+            href = a.get("href") or ""
+            href = href.strip()
+            if not href:
+                continue
+            abs_url = urllib.parse.urljoin(base_url, href)
+            # strip fragments
+            abs_url = _normalize_url(abs_url)
+            if abs_url.startswith("http"):
+                links.append(abs_url)
+        return links
+
+    def _passes_filters(
+        self,
+        url: str,
+        *,
+        include_keywords: List[str],
+        include_patterns: List[Pattern[str]],
+        exclude_patterns: List[Pattern[str]],
+        same_domain_only: bool,
+        seed_domain: str,
+    ) -> bool:
+        if _should_skip_url(url):
+            return False
+
+        if same_domain_only and _domain(url) != seed_domain:
+            return False
+
+        if exclude_patterns and _match_any(exclude_patterns, url):
+            return False
+
+        if include_patterns and not _match_any(include_patterns, url):
+            # If include patterns are given, require at least one match
+            return False
+
+        if include_keywords:
+            # keep if any keyword in URL path/query
+            u = url.lower()
+            if not any(k.lower() in u for k in include_keywords):
+                # still allow the seed/root pages
+                pass
+
+        return True
+
+    async def crawl_relevant(
+        self,
+        seed_url: str,
+        *,
+        depth: int,
+        max_pages: int,
+        include_link_keywords: List[str],
+        include_url_patterns: List[str],
+        exclude_url_patterns: List[str],
+        render_js: bool,
+        js_only: bool,
+        wait_until: str,
+        wait_ms: int,
+        same_domain_only: bool,
+        max_concurrency: int,
+        respect_robots: bool,
+    ) -> List[Tuple[str, str, str, str]]:
+        """
+        Returns list of (url, status, title, text)
+        """
+        seed_url = _normalize_url(seed_url)
+        seed_dom = _domain(seed_url)
+
+        include_pats = _compile_patterns(include_url_patterns)
+        exclude_pats = _compile_patterns(exclude_url_patterns)
+
+        seen: Set[str] = set()
+        q: Deque[Tuple[str, int]] = deque([(seed_url, 0)])
+
+        results: List[Tuple[str, str, str, str]] = []
+        sem = asyncio.Semaphore(max(1, int(max_concurrency)))
+
+        async def worker(url: str, d: int) -> None:
+            if url in seen:
+                return
+            seen.add(url)
+
+            if not self._passes_filters(
+                url,
+                include_keywords=include_link_keywords,
+                include_patterns=include_pats,
+                exclude_patterns=exclude_pats,
+                same_domain_only=same_domain_only,
+                seed_domain=seed_dom,
+            ):
+                return
+
+            if respect_robots:
+                rp = await self._ensure_robots(url)
+                if rp and not rp.can_fetch(self.user_agent, url):
+                    results.append((url, "error_robots", "", ""))
+                    return
+
+            async with sem:
+                st, title, text = await self._fetch_page(
+                    url,
+                    render_js=render_js,
+                    js_only=js_only,
+                    wait_until=wait_until,
+                    wait_ms=wait_ms,
+                )
+
+            results.append((url, st, title, text))
+
+        # BFS by depth
+        while q and len(results) < max_pages:
+            batch: List[Tuple[str, int]] = []
+            # pull a small batch
+            while q and len(batch) < max(2, max_concurrency * 2) and len(results) + len(batch) < max_pages:
+                batch.append(q.popleft())
+
+            await asyncio.gather(*(worker(u, d) for u, d in batch))
+
+            # Expand links for successful pages, only if we can still go deeper
+            if depth <= 0:
+                continue
+
+            # We only have text in results; for link expansion we need HTML.
+            # Strategy: for expansion, refetch HTML cheaply via httpx where possible.
+            for (u, st, _title, _text) in results[-len(batch):]:
+                if not st.startswith("ok"):
+                    continue
+                # Only expand if within depth limit
+                # We stored depth in batch; rebuild from batch map
+            # Use batch map:
+            depth_map = {u: d for (u, d) in batch}
+            for (u, st, _title, _text) in results[-len(batch):]:
+                d = depth_map.get(u, 0)
+                if d >= depth:
+                    continue
+                if not st.startswith("ok"):
+                    continue
+
+                # Fetch HTML for links expansion (httpx only; fast)
+                st2, html2 = await self._fetch_html_httpx(u, max_retries=1)
+                if not st2.startswith("ok") or not html2:
+                    continue
+
+                for link in self._extract_links(u, html2):
+                    if link not in seen:
+                        q.append((link, d + 1))
+
+        return results
+
+    # -----------------------------
+    # Jobs API
+    # -----------------------------
 
     async def submit_crawl_job(self, seed_urls: List[str], params: CrawlParams) -> str:
-        """
-        Enqueue a crawl job and return a job_id immediately.
-        """
-        # start workers lazily under a running loop
-        await self._ensure_workers()
-
-        norm_seeds = [_normalize_url(str(u)) for u in seed_urls if str(u).strip()]
-        job_id = uuid.uuid4().hex
+        job_id = str(uuid.uuid4())
         now = time.time()
-
         rec = JobRecord(
             job_id=job_id,
             created_at=now,
             updated_at=now,
             status="queued",
             params=params,
-            seed_urls=norm_seeds,
-            seeds_total=len(norm_seeds),
+            seed_urls=[_normalize_url(u) for u in seed_urls],
+            seeds_total=len(seed_urls),
             seeds_done=0,
         )
-
-        async with self._job_lock:
+        async with self._jobs_lock:
             self._jobs[job_id] = rec
-            await self._job_queue.put(job_id)
-
-        await self._emit_event(job_id, {"type": "job_queued", "job_id": job_id, "seeds_total": rec.seeds_total})
+        await self._job_queue.put(job_id)
         return job_id
 
-    async def get_job_status(self, job_id: str) -> Optional[dict]:
-        async with self._job_lock:
+    async def get_job_status(self, job_id: str) -> Optional[Dict[str, Any]]:
+        async with self._jobs_lock:
             rec = self._jobs.get(job_id)
-            if rec is None:
+            if not rec:
                 return None
             return {
                 "job_id": rec.job_id,
@@ -381,567 +864,125 @@ class PoliteScraper:
                 "max_pages_stored": self._max_pages_stored_per_job,
             }
 
-    async def get_job_results(self, job_id: str, *, offset: int = 0, limit: int = 100) -> Optional[List[PageResult]]:
-        async with self._job_lock:
+    async def get_job_results(self, job_id: str, *, offset: int, limit: int) -> Optional[List[PageResult]]:
+        async with self._jobs_lock:
             rec = self._jobs.get(job_id)
-            if rec is None:
+            if not rec:
                 return None
-            o = max(0, int(offset))
-            l = max(1, min(1000, int(limit)))
-            return rec.results[o : o + l]
+            return rec.results[offset: offset + limit]
 
     async def cancel_job(self, job_id: str) -> bool:
-        async with self._job_lock:
+        async with self._jobs_lock:
             rec = self._jobs.get(job_id)
-            if rec is None:
+            if not rec:
                 return False
             rec.cancel_event.set()
+            rec.status = "cancelled"
             rec.updated_at = time.time()
-            # Worker will mark status as cancelled soon; we mark intent here.
-            if rec.status in ("queued", "running"):
-                rec.status = "cancelled"
-        await self._emit_event(job_id, {"type": "job_cancel_requested", "job_id": job_id})
-        return True
+            return True
 
-    async def stream_job_events(self, job_id: str) -> Optional[asyncio.Queue[dict]]:
+    async def stream_job_events(self, job_id: str) -> AsyncGenerator[dict, None]:
         """
-        Returns the per-job event queue. Your FastAPI layer can convert this into SSE/websocket.
+        Optional: event streaming for UIs. Not required by main.py.
         """
-        async with self._job_lock:
+        async with self._jobs_lock:
             rec = self._jobs.get(job_id)
-            if rec is None:
-                return None
-            return rec.events
+            if not rec:
+                return
+            q = rec.events
 
-    # -----------------------
-    # Internal worker routines
-    # -----------------------
+        while True:
+            evt = await q.get()
+            yield evt
+            if evt.get("type") in ("done", "error", "cancelled"):
+                return
 
-    async def _ensure_workers(self) -> None:
-        if self._workers_started:
-            return
-        # This must run inside an event loop (FastAPI runtime is fine).
-        self._workers_started = True
-        for i in range(self._job_workers):
-            self._worker_tasks.append(asyncio.create_task(self._job_worker(i)))
+    async def _emit(self, rec: JobRecord, evt: dict) -> None:
+        try:
+            rec.events.put_nowait(evt)
+        except asyncio.QueueFull:
+            # drop events under pressure
+            pass
 
-        # cleanup task
-        self._worker_tasks.append(asyncio.create_task(self._job_cleanup_loop()))
-
-    async def _job_worker(self, worker_id: int) -> None:
+    async def _job_worker_loop(self) -> None:
         while True:
             job_id = await self._job_queue.get()
+            async with self._jobs_lock:
+                rec = self._jobs.get(job_id)
+            if not rec:
+                continue
+            if rec.cancel_event.is_set():
+                continue
             try:
-                await self._run_job(job_id, worker_id=worker_id)
-            except Exception as e:
-                # mark job error if still exists
-                async with self._job_lock:
-                    rec = self._jobs.get(job_id)
-                    if rec is not None:
-                        rec.status = "error"
-                        rec.error = f"{type(e).__name__}: {e}"
-                        rec.updated_at = time.time()
-                await self._emit_event(job_id, {"type": "job_error", "job_id": job_id, "error": str(e)})
-            finally:
-                self._job_queue.task_done()
-
-    async def _job_cleanup_loop(self) -> None:
-        while True:
-            await asyncio.sleep(30)
-            cutoff = time.time() - self._job_ttl_seconds
-            async with self._job_lock:
-                to_delete = [jid for jid, rec in self._jobs.items() if rec.updated_at < cutoff]
-                for jid in to_delete:
-                    self._jobs.pop(jid, None)
-
-    async def _emit_event(self, job_id: str, event: dict) -> None:
-        async with self._job_lock:
-            rec = self._jobs.get(job_id)
-            if rec is None:
-                return
-            # non-blocking put (drop if full)
-            try:
-                rec.events.put_nowait(event)
-            except asyncio.QueueFull:
-                pass
-
-    async def _run_job(self, job_id: str, *, worker_id: int) -> None:
-        async with self._job_lock:
-            rec = self._jobs.get(job_id)
-            if rec is None:
-                return
-            # if cancelled before start
-            if rec.cancel_event.is_set() or rec.status == "cancelled":
-                rec.status = "cancelled"
+                rec.status = "running"
                 rec.updated_at = time.time()
-                return
-            rec.status = "running"
-            rec.updated_at = time.time()
+                await self._emit(rec, {"type": "running", "job_id": rec.job_id})
 
-        await self._emit_event(job_id, {"type": "job_started", "job_id": job_id, "worker_id": worker_id})
-
-        # Process each seed URL sequentially (each seed itself uses concurrency internally)
-        for seed in await self._get_job_seeds(job_id):
-            if await self._job_cancelled(job_id):
-                await self._emit_event(job_id, {"type": "job_cancelled", "job_id": job_id})
-                return
-
-            await self._emit_event(job_id, {"type": "seed_started", "job_id": job_id, "seed_url": seed})
-
-            pages = await self.crawl_relevant(
-                seed,
-                depth=rec.params.depth,
-                max_pages=rec.params.max_pages,
-                include_link_keywords=rec.params.include_link_keywords,
-                include_url_patterns=rec.params.include_url_patterns,
-                exclude_url_patterns=rec.params.exclude_url_patterns,
-                render_js=rec.params.render_js,
-                js_only=rec.params.js_only,
-                wait_until=rec.params.wait_until,
-                wait_ms=rec.params.wait_ms,
-                same_domain_only=rec.params.same_domain_only,
-                max_concurrency=rec.params.max_concurrency,
-                respect_robots=rec.params.respect_robots,
-                job_id=job_id,  # enables progress increments
-            )
-
-            # Store results (bounded)
-            async with self._job_lock:
-                rec2 = self._jobs.get(job_id)
-                if rec2 is None:
-                    return
-                for (url, status, title, text) in pages:
-                    if rec2.pages_stored >= self._max_pages_stored_per_job:
+                # Execute seeds sequentially (each seed can be concurrent internally)
+                for seed in rec.seed_urls:
+                    if rec.cancel_event.is_set():
+                        rec.status = "cancelled"
+                        rec.updated_at = time.time()
+                        await self._emit(rec, {"type": "cancelled", "job_id": rec.job_id})
                         break
-                    rec2.results.append(PageResult(url=url, status=status, title=title, text=text))
-                    rec2.pages_stored += 1
-                rec2.seeds_done += 1
-                rec2.updated_at = time.time()
 
-            await self._emit_event(job_id, {"type": "seed_done", "job_id": job_id, "seed_url": seed})
+                    pages = await self.crawl_relevant(
+                        seed,
+                        depth=rec.params.depth,
+                        max_pages=rec.params.max_pages,
+                        include_link_keywords=rec.params.include_link_keywords,
+                        include_url_patterns=rec.params.include_url_patterns,
+                        exclude_url_patterns=rec.params.exclude_url_patterns,
+                        render_js=rec.params.render_js,
+                        js_only=rec.params.js_only,
+                        wait_until=rec.params.wait_until,
+                        wait_ms=rec.params.wait_ms,
+                        same_domain_only=rec.params.same_domain_only,
+                        max_concurrency=rec.params.max_concurrency,
+                        respect_robots=rec.params.respect_robots,
+                    )
 
-        async with self._job_lock:
-            rec = self._jobs.get(job_id)
-            if rec is None:
-                return
-            if rec.status != "cancelled":
-                rec.status = "done"
-            rec.updated_at = time.time()
+                    rec.seeds_done += 1
+                    rec.updated_at = time.time()
 
-        await self._emit_event(job_id, {"type": "job_done", "job_id": job_id})
+                    # Store bounded results
+                    for (u, st, title, text) in pages:
+                        rec.pages_attempted += 1
+                        if rec.pages_stored >= self._max_pages_stored_per_job:
+                            continue
+                        rec.results.append(PageResult(url=u, status=st, title=title, text=text))
+                        rec.pages_stored += 1
 
-    async def _get_job_seeds(self, job_id: str) -> List[str]:
-        async with self._job_lock:
-            rec = self._jobs.get(job_id)
-            return rec.seed_urls[:] if rec else []
-
-    async def _job_cancelled(self, job_id: str) -> bool:
-        async with self._job_lock:
-            rec = self._jobs.get(job_id)
-            if rec is None:
-                return True
-            return rec.cancel_event.is_set() or rec.status == "cancelled"
-
-    # -----------------------------
-    # Original scraper functionality
-    # -----------------------------
-
-    def get_domain(self, url: str) -> str:
-        return urllib.parse.urlparse(url).netloc.lower()
-
-    def _robots_url(self, url: str) -> str:
-        parsed = urllib.parse.urlparse(url)
-        scheme = parsed.scheme or "https"
-        netloc = parsed.netloc
-        return f"{scheme}://{netloc}/robots.txt"
-
-    async def load_robots(self, url: str) -> None:
-        domain = self.get_domain(url)
-        robots_url = self._robots_url(url)
-
-        rp = RobotFileParser()
-        try:
-            resp = await self._client.get(robots_url, timeout=5.0)
-            if resp.status_code == 200:
-                rp.parse(resp.text.splitlines())
-            else:
-                rp.parse([])
-        except Exception:
-            rp.parse([])
-
-        raw_delay: Union[str, float, None] = rp.crawl_delay(self.user_agent)
-        if raw_delay is None:
-            delay: float = DEFAULT_DELAY
-        else:
-            try:
-                delay = float(raw_delay)
-            except (TypeError, ValueError):
-                delay = DEFAULT_DELAY
-
-        self.domain_rules[domain] = rp
-        self.crawl_delay[domain] = delay
-
-    async def can_fetch(self, url: str, *, respect_robots: bool = True) -> bool:
-        if not respect_robots:
-            return True
-        domain = self.get_domain(url)
-        if domain not in self.domain_rules:
-            await self.load_robots(url)
-        rp = self.domain_rules[domain]
-        return rp.can_fetch(self.user_agent, url)
-
-    async def obey_rate_limit(self, url: str) -> None:
-        domain = self.get_domain(url)
-        delay: float = self.crawl_delay.get(domain, DEFAULT_DELAY)
-        last: float = self.last_access.get(domain, 0.0)
-        now: float = time.time()
-        wait: float = delay - (now - last)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        self.last_access[domain] = time.time()
-
-    async def _ensure_browser(self) -> "Browser":
-        try:
-            from playwright.async_api import async_playwright  # type: ignore
-        except Exception as e:
-            raise RuntimeError(
-                "Playwright is not installed. Add 'playwright' to requirements.txt and ensure browsers are installed."
-            ) from e
-
-        async with self._pw_lock:
-            if self._browser is not None:
-                return self._browser
-            if self._pw is None:
-                self._pw = await async_playwright().start()
-
-            self._browser = await self._pw.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-            )
-            return self._browser
-
-    async def _get_html_http(self, url: str) -> Tuple[str, str, str]:
-        try:
-            resp = await self._client.get(url, timeout=self.default_timeout)
-            ct = resp.headers.get("content-type", "") or ""
-            body = resp.text if isinstance(resp.text, str) else ""
-            if _looks_blocked(resp.status_code, body):
-                return ("blocked", "", ct)
-            if resp.status_code != 200:
-                return (f"http_{resp.status_code}", "", ct)
-            return ("ok", body, ct)
-        except httpx.TimeoutException:
-            return ("error_timeout", "", "")
-        except httpx.HTTPError:
-            return ("error_http", "", "")
-        except Exception as e:
-            return (f"error_{type(e).__name__}", "", "")
-
-    async def _get_html_playwright(
-        self,
-        url: str,
-        *,
-        wait_until: str = "networkidle",
-        wait_ms: int = 0,
-        timeout: Optional[float] = None,
-    ) -> Tuple[str, str]:
-        try:
-            browser = await self._ensure_browser()
-            context = await browser.new_context(user_agent=self.user_agent, java_script_enabled=True)
-            page = await context.new_page()
-            to_ms = int((timeout or (self.default_timeout * 2)) * 1000)
-
-            try:
-                await page.goto(url, wait_until=wait_until, timeout=to_ms)  # type: ignore[arg-type]
-                if wait_ms > 0:
-                    await page.wait_for_timeout(wait_ms)
-                html = await page.content()
-            finally:
-                await page.close()
-                await context.close()
-
-            if _looks_blocked(200, html):
-                return ("blocked", "")
-            return ("ok", html)
-        except asyncio.TimeoutError:
-            return ("error_playwright_timeout", "")
-        except Exception:
-            return ("error_playwright", "")
-
-    async def fetch(
-        self,
-        url: str,
-        *,
-        render_js: bool = False,
-        js_only: bool = False,
-        wait_until: str = "networkidle",
-        wait_ms: int = 0,
-        respect_robots: bool = True,
-    ) -> Tuple[str, str]:
-        url = _normalize_url(url)
-
-        if not await self.can_fetch(url, respect_robots=respect_robots):
-            return ("blocked_by_robots", "")
-
-        await self.obey_rate_limit(url)
-
-        if render_js and js_only:
-            st_html, html = await self._get_html_playwright(url, wait_until=wait_until, wait_ms=wait_ms)
-            if not st_html.startswith("ok"):
-                return (st_html, "")
-            soup = BeautifulSoup(html, "html.parser")
-            text = _html_to_text(soup)
-            return ("ok", text if text else html[:MAX_TEXT_CHARS])
-
-        st, body, ct = await self._get_html_http(url)
-        if not st.startswith("ok"):
-            # fallback to Playwright if enabled
-            if render_js and (st in ("blocked", "error_timeout", "error_http") or st.startswith("http_")):
-                st_html, html = await self._get_html_playwright(url, wait_until=wait_until, wait_ms=wait_ms)
-                if not st_html.startswith("ok"):
-                    return (st_html, "")
-                soup = BeautifulSoup(html, "html.parser")
-                text = _html_to_text(soup)
-                return ("ok", text if text else html[:MAX_TEXT_CHARS])
-            return (st, "")
-
-        if _is_likely_json(ct):
-            try:
-                data = json.loads(body)
-            except Exception:
-                return ("ok", body[:MAX_TEXT_CHARS])
-            return ("ok_json", _json_to_text(data))
-
-        if _is_likely_html(ct) or "<html" in body.lower():
-            if render_js and _looks_js_shell(body):
-                st_html, html = await self._get_html_playwright(url, wait_until=wait_until, wait_ms=wait_ms)
-                if st_html.startswith("ok"):
-                    soup = BeautifulSoup(html, "html.parser")
-                    text = _html_to_text(soup)
-                    return ("ok", text if text else html[:MAX_TEXT_CHARS])
-            soup = BeautifulSoup(body, "html.parser")
-            return ("ok", _html_to_text(soup))
-
-        return ("ok", body[:MAX_TEXT_CHARS])
-
-    async def fetch_with_links(
-        self,
-        url: str,
-        *,
-        render_js: bool = False,
-        js_only: bool = False,
-        wait_until: str = "networkidle",
-        wait_ms: int = 0,
-        same_domain_only: bool = True,
-        respect_robots: bool = True,
-    ) -> Tuple[str, str, List[str], str]:
-        url = _normalize_url(url)
-
-        status, text = await self.fetch(
-            url,
-            render_js=render_js,
-            js_only=js_only,
-            wait_until=wait_until,
-            wait_ms=wait_ms,
-            respect_robots=respect_robots,
-        )
-
-        html: str = ""
-        title: str = ""
-        links: List[str] = []
-
-        if status.startswith("ok"):
-            if render_js and js_only:
-                st_html, html = await self._get_html_playwright(url, wait_until=wait_until, wait_ms=wait_ms)
-                if not st_html.startswith("ok"):
-                    return status, text, [], ""
-            else:
-                if not await self.can_fetch(url, respect_robots=respect_robots):
-                    return status, text, [], ""
-                await self.obey_rate_limit(url)
-                st_http, body, ct = await self._get_html_http(url)
-                if st_http.startswith("ok") and (_is_likely_html(ct) or "<html" in body.lower()):
-                    html = body
-                elif render_js:
-                    st_html, html = await self._get_html_playwright(url, wait_until=wait_until, wait_ms=wait_ms)
-                    if not st_html.startswith("ok"):
-                        html = ""
-
-        if html:
-            soup = BeautifulSoup(html, "html.parser")
-            title = _extract_title(soup)
-            links = _extract_links(url, soup, same_domain_only=same_domain_only)
-
-        return status, text, links, title
-
-    def _url_allowed(
-        self,
-        url: str,
-        *,
-        same_domain_only: bool,
-        start_url: str,
-        include_patterns: List[Pattern[str]],
-        exclude_patterns: List[Pattern[str]],
-    ) -> bool:
-        url = _normalize_url(url)
-
-        if _is_skippable_url(url):
-            return False
-        if same_domain_only and not _same_domain(url, start_url):
-            return False
-        if exclude_patterns and _matches_any(url, exclude_patterns):
-            return False
-        if include_patterns:
-            return _matches_any(url, include_patterns)
-        return True
-
-    async def crawl_relevant(
-        self,
-        start_url: str,
-        *,
-        depth: int = 0,
-        max_pages: int = 30,
-        include_link_keywords: Optional[List[str]] = None,
-        include_url_patterns: Optional[List[str]] = None,
-        exclude_url_patterns: Optional[List[str]] = None,
-        render_js: bool = False,
-        js_only: bool = False,
-        wait_until: str = "networkidle",
-        wait_ms: int = 0,
-        same_domain_only: bool = True,
-        max_concurrency: int = 2,
-        respect_robots: bool = True,
-        job_id: Optional[str] = None,  # NEW: progress updates if provided
-    ) -> List[Tuple[str, str, str, str]]:
-        start_url = _normalize_url(start_url)
-
-        include_keywords = [kw for kw in (include_link_keywords or []) if (kw or "").strip()]
-        include_patterns = _compile_patterns(include_url_patterns)
-        exclude_patterns = _compile_patterns(exclude_url_patterns)
-
-        visited: Set[str] = set()
-        queue: Deque[Tuple[str, int]] = deque([(start_url, 0)])
-        results: List[Tuple[str, str, str, str]] = []
-
-        sem = asyncio.Semaphore(max(1, int(max_concurrency)))
-
-        async def process_one(url_in: str, d: int) -> Tuple[str, int, str, str, str, List[str]]:
-            async with sem:
-                url_norm = _normalize_url(url_in)
-
-                # If job cancelled, short-circuit quickly
-                if job_id is not None and await self._job_cancelled(job_id):
-                    return (url_norm, d, "cancelled", "", "", [])
-
-                st, txt, links, title = await self.fetch_with_links(
-                    url_norm,
-                    render_js=render_js,
-                    js_only=js_only,
-                    wait_until=wait_until,
-                    wait_ms=wait_ms,
-                    same_domain_only=same_domain_only,
-                    respect_robots=respect_robots,
-                )
-
-                if job_id is not None:
-                    async with self._job_lock:
-                        rec = self._jobs.get(job_id)
-                        if rec is not None:
-                            rec.pages_attempted += 1
-                            rec.updated_at = time.time()
-                    await self._emit_event(
-                        job_id,
+                    await self._emit(
+                        rec,
                         {
-                            "type": "page_done",
-                            "job_id": job_id,
-                            "url": url_norm,
-                            "status": st,
-                            "depth": d,
+                            "type": "progress",
+                            "job_id": rec.job_id,
+                            "seeds_done": rec.seeds_done,
+                            "seeds_total": rec.seeds_total,
+                            "pages_attempted": rec.pages_attempted,
+                            "pages_stored": rec.pages_stored,
                         },
                     )
 
-                return (url_norm, d, st, title, txt, links)
+                if rec.status not in ("cancelled", "error"):
+                    rec.status = "done"
+                    rec.updated_at = time.time()
+                    await self._emit(rec, {"type": "done", "job_id": rec.job_id})
 
-        while queue and len(results) < max_pages:
-            if job_id is not None and await self._job_cancelled(job_id):
-                break
+            except Exception as e:
+                rec.status = "error"
+                rec.error = f"{type(e).__name__}: {e}"
+                rec.updated_at = time.time()
+                await self._emit(rec, {"type": "error", "job_id": rec.job_id, "error": rec.error})
+            finally:
+                self._job_queue.task_done()
 
-            batch: List[Tuple[str, int]] = []
-            while queue and len(batch) < max_concurrency and (len(results) + len(batch) < max_pages):
-                u, d = queue.popleft()
-                u = _normalize_url(u)
-                if u in visited:
-                    continue
-                if not self._url_allowed(
-                    u,
-                    same_domain_only=same_domain_only,
-                    start_url=start_url,
-                    include_patterns=include_patterns,
-                    exclude_patterns=exclude_patterns,
-                ):
-                    continue
-                visited.add(u)
-                batch.append((u, d))
-
-            if not batch:
-                continue
-
-            batch_results = await asyncio.gather(*(process_one(u, d) for u, d in batch))
-
-            for url_norm, d, status, title, text, links in batch_results:
-                # cancellation marker
-                if status == "cancelled":
-                    continue
-
-                results.append((url_norm, status, title, text))
-                if len(results) >= max_pages:
-                    break
-
-                if d >= depth:
-                    continue
-                if status.startswith(("blocked", "error")) or status.startswith("http_"):
-                    continue
-
-                if include_keywords:
-                    low_keywords = [k.lower() for k in include_keywords]
-                    next_links = []
-                    for lnk in links:
-                        lnk_n = _normalize_url(lnk)
-                        if any(k in lnk_n.lower() for k in low_keywords):
-                            next_links.append(lnk_n)
-                else:
-                    next_links = [_normalize_url(lnk) for lnk in links]
-
-                for lnk in next_links:
-                    if len(results) + len(queue) >= max_pages:
-                        break
-                    if lnk in visited:
-                        continue
-                    if not self._url_allowed(
-                        lnk,
-                        same_domain_only=same_domain_only,
-                        start_url=start_url,
-                        include_patterns=include_patterns,
-                        exclude_patterns=exclude_patterns,
-                    ):
-                        continue
-                    queue.append((lnk, d + 1))
-
-        return results
-
-    async def aclose(self) -> None:
-        await self._client.aclose()
-
-        async with self._pw_lock:
-            if self._browser is not None:
-                try:
-                    await self._browser.close()
-                except Exception:
-                    pass
-                self._browser = None
-            if self._pw is not None:
-                try:
-                    await self._pw.stop()
-                except Exception:
-                    pass
-                self._pw = None
+    async def _cleanup_jobs_loop(self) -> None:
+        while True:
+            await asyncio.sleep(30)
+            cutoff = time.time() - self._job_ttl_seconds
+            async with self._jobs_lock:
+                to_delete = [jid for jid, rec in self._jobs.items() if rec.updated_at < cutoff]
+                for jid in to_delete:
+                    del self._jobs[jid]
