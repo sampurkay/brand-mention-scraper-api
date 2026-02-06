@@ -22,6 +22,80 @@ class ScrapeOptions(BaseModel):
     context_chars: int = Field(default=200, ge=0, le=5000)
 
 
+class PlaywrightOptions(BaseModel):
+    """
+    Controls specific to JS-rendered pages.
+    These are safe defaults; enable features only when needed.
+    """
+
+    # --- Navigation / waiting ---
+    wait_for_selector: Optional[str] = Field(
+        default=None,
+        description="If set, Playwright will wait for this selector before extracting content (useful for SPAs).",
+    )
+    selector_timeout_ms: int = Field(
+        default=15000,
+        ge=0,
+        le=60000,
+        description="Timeout for wait_for_selector.",
+    )
+
+    # --- Resource blocking (speed + lower bandwidth) ---
+    block_images: bool = Field(default=True)
+    block_fonts: bool = Field(default=True)
+    block_media: bool = Field(default=True)
+    block_stylesheets: bool = Field(
+        default=False,
+        description="Can speed up but may break layout-dependent rendering.",
+    )
+
+    # --- Extraction ---
+    prefer_inner_text: bool = Field(
+        default=True,
+        description="If true, tries document.body.innerText (often better for dynamic pages) before HTML parsing fallback.",
+    )
+
+    # --- Infinite scroll ---
+    enable_infinite_scroll: bool = Field(
+        default=False,
+        description="Enable scrolling to load additional content (feeds, long pages).",
+    )
+    max_scrolls: int = Field(default=12, ge=0, le=200)
+    scroll_pause_ms: int = Field(default=600, ge=0, le=10000)
+    stable_rounds: int = Field(
+        default=2,
+        ge=1,
+        le=10,
+        description="Stop scrolling after page height doesn't change for this many rounds.",
+    )
+
+    # --- Pagination clicking (heuristic) ---
+    enable_pagination: bool = Field(
+        default=False,
+        description="Enable heuristic clicking of Next controls to traverse pagination.",
+    )
+    pagination_max_pages: int = Field(default=4, ge=1, le=50)
+    next_selectors: List[str] = Field(
+        default_factory=list,
+        description="Optional CSS/text selectors tried in order to click 'next'. If empty, built-in defaults are used.",
+    )
+
+
+class RetryOptions(BaseModel):
+    base_delay_s: float = Field(
+        default=0.75,
+        ge=0.0,
+        le=30.0,
+        description="Exponential backoff base delay in seconds.",
+    )
+    max_retries: int = Field(
+        default=2,
+        ge=0,
+        le=10,
+        description="Max retries per page fetch (HTTP or Playwright).",
+    )
+
+
 class ScrapeRequest(BaseModel):
     # Seed URLs: keep strict/validated
     urls: List[HttpUrl]
@@ -71,7 +145,7 @@ class ScrapeRequest(BaseModel):
         default=False,
         description="If true and render_js=true, always use Playwright (not just fallback).",
     )
-    wait_until: Literal["domcontentloaded", "networkidle"] = Field(
+    wait_until: Literal["load", "domcontentloaded", "networkidle"] = Field(
         default="networkidle",
         description="Playwright navigation wait condition.",
     )
@@ -80,6 +154,16 @@ class ScrapeRequest(BaseModel):
         ge=0,
         le=30000,
         description="Extra milliseconds to wait after navigation (helps SPAs hydrate).",
+    )
+
+    playwright: PlaywrightOptions = Field(
+        default_factory=PlaywrightOptions,
+        description="Playwright-specific controls (waiting, scrolling, pagination, resource blocking).",
+    )
+
+    retry: RetryOptions = Field(
+        default_factory=RetryOptions,
+        description="Retry behavior with exponential backoff.",
     )
 
     # ---- Performance / politeness ----
@@ -131,6 +215,3 @@ class ScrapeSummary(BaseModel):
 class ScrapeResponse(BaseModel):
     summary: ScrapeSummary
     results_by_url: List[UrlResult]
-
-
-    
