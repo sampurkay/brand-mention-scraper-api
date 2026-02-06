@@ -109,6 +109,8 @@ async def scrape(payload: ScrapeRequest) -> ScrapeResponse:
             same_domain_only=payload.same_domain_only,
             max_concurrency=payload.max_concurrency,
             respect_robots=payload.respect_robots,
+            playwright=payload.playwright,
+            retry=payload.retry,
         )
 
         for page_url_str, status, _title, text in pages:
@@ -181,6 +183,8 @@ async def create_job(payload: ScrapeRequest) -> JobSubmitResponse:
         same_domain_only=payload.same_domain_only,
         max_concurrency=payload.max_concurrency,
         respect_robots=payload.respect_robots,
+        playwright=payload.playwright,
+        retry=payload.retry,
     )
     job_id = await scraper.submit_crawl_job([str(u) for u in payload.urls], params)
     return JobSubmitResponse(job_id=job_id)
