@@ -1,87 +1,147 @@
+from __future__ import annotations
+
 import re
-from typing import List, Dict, Any, Tuple, Set
-from models import Brand, ScrapeOptions, MatchSnippet, ProductMatch
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
 
-def _build_term_list(brands: List[Brand]) -> List[Dict[str, Any]]:
-    terms: List[Dict[str, Any]] = []
-    seen: Set[Tuple[str, str, str]] = set()  # (brand, product_or_empty, normalized_term)
+from app.models import Brand, ScrapeOptions, MatchSnippet, ProductMatch
 
-    for brand in brands:
-        brand_terms = [brand.name, *brand.aliases]
-        for t in brand_terms:
-            norm = t.strip().lower()
-            if not norm:
-                continue
-            key = (brand.name, "", norm)
-            if key in seen:
-                continue
-            seen.add(key)
-            terms.append({"brand": brand.name, "product": None, "term": t.strip()})
 
-        for product in brand.products:
-            product_terms = [product.name, *product.aliases, *product.skus]
-            for t in product_terms:
-                norm = t.strip().lower()
-                if not norm:
-                    continue
-                key = (brand.name, product.name, norm)
-                if key in seen:
-                    continue
-                seen.add(key)
-                terms.append({"brand": brand.name, "product": product.name, "term": t.strip()})
+@dataclass(frozen=True)
+class _Term:
+    brand: str
+    product: Optional[str]
+    term: str
 
-    terms.sort(key=lambda x: len(x["term"]), reverse=True)
-    return terms
 
-def _compile_term_pattern(term: str) -> re.Pattern[str]:
-    escaped = re.escape(term)
-    # If term is purely letters/spaces, use word boundaries to avoid substring matches
-    if re.fullmatch(r"[A-Za-z ]+", term):
-        return re.compile(rf"\b{escaped}\b", flags=re.IGNORECASE)
-    return re.compile(escaped, flags=re.IGNORECASE)
+def _normalize(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
 
-def find_matches_in_text(
-    text: str,
-    brands: List[Brand],
-    options: ScrapeOptions
-) -> List[ProductMatch]:
 
-    terms = _build_term_list(brands)
-    all_matches: Dict[str, ProductMatch] = {}
+def _build_terms(brands: Sequence[Brand]) -> List[_Term]:
+    """
+    Build a flat list of match terms:
+      - brand names + brand aliases => product=None
+      - product names + product aliases + skus => product=<name>
+    """
+    terms: List[_Term] = []
 
-    half_ctx = max(0, options.context_chars // 2)
+    for b in brands:
+        bname = _normalize(b.name)
+        if bname:
+            terms.append(_Term(brand=b.name, product=None, term=bname))
 
-    for term_info in terms:
-        term = term_info["term"]
-        if not term:
+        for a in (b.aliases or []):
+            a = _normalize(a)
+            if a:
+                terms.append(_Term(brand=b.name, product=None, term=a))
+
+        for p in (b.products or []):
+            pname = _normalize(p.name)
+            if pname:
+                terms.append(_Term(brand=b.name, product=p.name, term=pname))
+
+            for pa in (p.aliases or []):
+                pa = _normalize(pa)
+                if pa:
+                    terms.append(_Term(brand=b.name, product=p.name, term=pa))
+
+            for sku in (p.skus or []):
+                sku = _normalize(sku)
+                if sku:
+                    terms.append(_Term(brand=b.name, product=p.name, term=sku))
+
+    # Deduplicate identical (brand, product, term)
+    seen: set[Tuple[str, Optional[str], str]] = set()
+    uniq: List[_Term] = []
+    for t in terms:
+        key = (t.brand, t.product, t.term.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(t)
+
+    # Longer terms first reduces overlaps (e.g., "Ferinject" before "Iron")
+    uniq.sort(key=lambda x: len(x.term), reverse=True)
+    return uniq
+
+
+def _find_all_matches(text: str, term: str) -> List[Tuple[int, int]]:
+    """
+    Case-insensitive, word-boundary-ish matching.
+    Uses \b when term is alphanumeric-ish; otherwise falls back to substring search.
+    Returns list of (start, end) spans.
+    """
+    if not term:
+        return []
+
+    # If term is purely word characters/spaces, use boundaries around words
+    if re.fullmatch(r"[\w\s\-]+", term):
+        pattern = re.compile(rf"\b{re.escape(term)}\b", re.IGNORECASE)
+        return [(m.start(), m.end()) for m in pattern.finditer(text)]
+    else:
+        pattern = re.compile(re.escape(term), re.IGNORECASE)
+        return [(m.start(), m.end()) for m in pattern.finditer(text)]
+
+
+def _make_snippet(text: str, start: int, end: int, context: int) -> str:
+    left = max(0, start - context)
+    right = min(len(text), end + context)
+    snippet = text[left:right].strip()
+    return snippet
+
+
+def find_matches_in_text(text: str, brands: List[Brand], options: ScrapeOptions) -> List[ProductMatch]:
+    """
+    Returns ProductMatch entries with:
+      - brand
+      - optional product
+      - count (number of occurrences across all matched terms for that brand/product)
+      - matches: list of MatchSnippet with the matched term and a surrounding snippet
+    """
+    src = text or ""
+    if not src.strip():
+        return []
+
+    context = int(getattr(options, "context_chars", 200) or 200)
+
+    terms = _build_terms(brands)
+
+    # Aggregate by (brand, product)
+    agg: Dict[Tuple[str, Optional[str]], Dict[str, any]] = {}
+
+    for t in terms:
+        spans = _find_all_matches(src, t.term)
+        if not spans:
             continue
 
-        pattern = _compile_term_pattern(term)
-        for m in pattern.finditer(text):
-            start = max(0, m.start() - half_ctx)
-            end = min(len(text), m.end() + half_ctx)
-            snippet_text = text[start:end]
+        key = (t.brand, t.product)
+        if key not in agg:
+            agg[key] = {"count": 0, "snips": []}
 
-            key = f"{term_info['brand']}||{term_info['product'] or ''}"
-            pm = all_matches.get(key)
-            if pm is None:
-                pm = ProductMatch(
-                    brand=term_info["brand"],
-                    product=term_info["product"],
-                    count=0,
-                    matches=[]
-                )
-                all_matches[key] = pm
-
-            pm.count += 1
-            pm.matches.append(
+        for (s, e) in spans:
+            agg[key]["count"] += 1
+            agg[key]["snips"].append(
                 MatchSnippet(
-                    brand=term_info["brand"],
-                    product=term_info["product"],
-                    matched_term=term,
-                    text_snippet=snippet_text
+                    brand=t.brand,
+                    product=t.product,
+                    matched_term=t.term,
+                    text_snippet=_make_snippet(src, s, e, context),
                 )
             )
 
-    return list(all_matches.values())
-    
+    # Convert to ProductMatch list
+    out: List[ProductMatch] = []
+    for (brand, product), data in agg.items():
+        out.append(
+            ProductMatch(
+                brand=brand,
+                product=product,
+                count=int(data["count"]),
+                matches=data["snips"],
+            )
+        )
+
+    # Stable ordering: highest counts first
+    out.sort(key=lambda pm: pm.count, reverse=True)
+    return out
