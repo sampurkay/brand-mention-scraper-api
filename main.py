@@ -16,7 +16,6 @@ from app.models import (
 from app.scraper import PoliteScraper, CrawlParams
 from app.matching import find_matches_in_text
 
-
 # Global scraper instance (closed via lifespan)
 scraper = PoliteScraper()
 
@@ -27,7 +26,16 @@ async def lifespan(app: FastAPI):
     await scraper.aclose()
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    title="Brand Mention Scraper API",
+    description=(
+        "Internal API for crawling web pages and extracting brand and product mentions. "
+        "Supports polite crawling, optional JavaScript rendering, relevance-aware link following, "
+        "and asynchronous job-based execution. Designed for GPT-driven automation workflows."
+    ),
+    version="0.1.0",
+    lifespan=lifespan,
+)
 
 
 # -----------------------
@@ -75,7 +83,7 @@ class JobCancelResponse(BaseModel):
 
 @app.get("/")
 def home() -> Dict[str, str]:
-    return {"status": "ok", "message": "Scraper API running"}
+    return {"status": "ok", "message": "brand-mention-scraper-api running"}
 
 
 # --------------------------------------------------------------------
@@ -109,20 +117,18 @@ async def scrape(payload: ScrapeRequest) -> ScrapeResponse:
             same_domain_only=payload.same_domain_only,
             max_concurrency=payload.max_concurrency,
             respect_robots=payload.respect_robots,
-            playwright=payload.playwright,
-            retry=payload.retry,
+            playwright=payload.playwright,          # NEW
+            retry=payload.retry,                    # NEW
+            link_relevance_mode=payload.link_relevance_mode,      # NEW
+            link_priority_keywords=payload.link_priority_keywords,  # NEW
         )
 
         for page_url_str, status, _title, text in pages:
             if not status.startswith("ok"):
-                results.append(
-                    UrlResult(url=page_url_str, status=status, product_mentions=[])
-                )
+                results.append(UrlResult(url=page_url_str, status=status, product_mentions=[]))
                 continue
 
-            matches = find_matches_in_text(
-                text=text, brands=payload.brands, options=payload.options
-            )
+            matches = find_matches_in_text(text=text, brands=payload.brands, options=payload.options)
 
             for m in matches:
                 brand_key: str = m.brand
@@ -138,9 +144,7 @@ async def scrape(payload: ScrapeRequest) -> ScrapeResponse:
                     summary[brand_key][product_key]["urls"] += 1
                     url_sets[pair].add(page_url_str)
 
-            results.append(
-                UrlResult(url=page_url_str, status=status, product_mentions=matches)
-            )
+            results.append(UrlResult(url=page_url_str, status=status, product_mentions=matches))
 
     summary_items: List[SummaryItem] = []
     for brand_key, pdata in summary.items():
@@ -183,8 +187,11 @@ async def create_job(payload: ScrapeRequest) -> JobSubmitResponse:
         same_domain_only=payload.same_domain_only,
         max_concurrency=payload.max_concurrency,
         respect_robots=payload.respect_robots,
+        # NEW
         playwright=payload.playwright,
         retry=payload.retry,
+        link_relevance_mode=payload.link_relevance_mode,
+        link_priority_keywords=payload.link_priority_keywords,
     )
     job_id = await scraper.submit_crawl_job([str(u) for u in payload.urls], params)
     return JobSubmitResponse(job_id=job_id)
@@ -216,7 +223,6 @@ async def job_results(
     if page_results is None:
         raise HTTPException(status_code=404, detail="job_id not found")
 
-    # Return page URLs + status only (mentions are computed via /summary)
     url_results: List[UrlResult] = [
         UrlResult(url=pr.url, status=pr.status, product_mentions=[])
         for pr in page_results
@@ -244,25 +250,16 @@ async def job_summary(job_id: str, payload: ScrapeRequest) -> JobSummaryResponse
     url_results: List[UrlResult] = []
     for pr in stored:
         if not pr.status.startswith("ok"):
-            url_results.append(
-                UrlResult(url=pr.url, status=pr.status, product_mentions=[])
-            )
+            url_results.append(UrlResult(url=pr.url, status=pr.status, product_mentions=[]))
             continue
-
-        matches = find_matches_in_text(
-            text=pr.text, brands=payload.brands, options=payload.options
-        )
-        url_results.append(
-            UrlResult(url=pr.url, status=pr.status, product_mentions=matches)
-        )
+        matches = find_matches_in_text(text=pr.text, brands=payload.brands, options=payload.options)
+        url_results.append(UrlResult(url=pr.url, status=pr.status, product_mentions=matches))
 
     summary = _summarize_url_results(url_results, payload)
     return JobSummaryResponse(job_id=job_id, summary=summary)
 
 
-def _summarize_url_results(
-    url_results: List[UrlResult], payload: ScrapeRequest
-) -> ScrapeSummary:
+def _summarize_url_results(url_results: List[UrlResult], payload: ScrapeRequest) -> ScrapeSummary:
     summary: dict[str, dict[str, dict[str, int]]] = {b.name: {} for b in payload.brands}
     url_sets: dict[tuple[str, str], set[str]] = {}
 
