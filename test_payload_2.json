@@ -1,0 +1,80 @@
+{
+  "urls": ["https://www.hemequity.com/"],
+
+  "brands": [
+    {
+      "name": "Ferinject",
+      "aliases": ["ferric carboxymaltose"],
+      "products": []
+    },
+    { "name": "Monoferric", "aliases": [], "products": [] },
+    { "name": "Injectafer", "aliases": [], "products": [] },
+    { "name": "Venofer", "aliases": [], "products": [] },
+    { "name": "Feraheme", "aliases": [], "products": [] }
+  ],
+
+  "options": { "context_chars": 200 },
+
+  "crawl_depth": 2,
+  "max_pages": 120,
+  "same_domain_only": true,
+
+  "include_link_keywords": [],
+
+  "include_url_patterns": [
+    "^https://www\\.hemequity\\.com/?$",
+    "^https://www\\.hemequity\\.com/(fr|es|ar)/.*$",
+    "^https://www\\.hemequity\\.com/(raise-the-bar|iron-education|take-control-period)(-[a-z0-9-]+)?/?$",
+    "^https://www\\.hemequity\\.com/(hmb)([/-][a-z0-9-]+)?/?$",
+    "^https://www\\.hemequity\\.com/(journal-publications|poster-publications|poster-presentations|copy-of-poster-presentations)/?$",
+    "^https://www\\.hemequity\\.com/(our-resources-for-healthcare-providers|our-resources-for-patients)/?$",
+    "^https://www\\.hemequity\\.com/(get-involved|our-team|our-partners|coagwiz|toronto-iv-iron-policy)/?$"
+  ],
+
+  "exclude_url_patterns": [
+    "(/login|/signin|/sign-in|/account|/register)",
+    "(/cart|/checkout|/basket)",
+    "(/search|\\?s=|\\?q=|\\?query=)",
+    "(/wp-admin|/wp-json)",
+    "\\.(jpg|jpeg|png|gif|svg|webp|ico|pdf|doc|docx|ppt|pptx|xls|xlsx|zip|rar|7z|mp4|mp3|wav|csv|json|xml|txt)(\\?.*)?$",
+    "/(?:_next|static|assets|images|img|fonts|uploads|media)/",
+    "/(?:api|cdn-cgi)/",
+    "surveymonkey\\.com"
+  ],
+
+  "link_relevance_mode": "prioritize",
+  "link_priority_keywords": [
+    "treatment", "safety", "hcp", "healthcare", "provider", "patient",
+    "resources", "education", "faq", "indication", "dosing", "administration",
+    "warnings", "contraindications", "adverse", "prescribing", "pi",
+    "clinical", "trial", "publications", "posters"
+  ],
+
+  "render_js": true,
+  "js_only": false,
+  "wait_until": "networkidle",
+  "wait_ms": 500,
+
+  "playwright": {
+    "wait_for_selector": "main, article, [role='main'], #app, #__next, body",
+    "selector_timeout_ms": 15000,
+
+    "block_images": true,
+    "block_fonts": true,
+    "block_media": true,
+    "block_stylesheets": false,
+
+    "prefer_inner_text": true,
+
+    "enable_infinite_scroll": false,
+    "enable_pagination": false
+  },
+
+  "retry": {
+    "base_delay_s": 0.75,
+    "max_retries": 2
+  },
+
+  "max_concurrency": 2,
+  "respect_robots": true
+}
