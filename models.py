@@ -14,7 +14,6 @@ class Product(BaseModel):
 class Brand(BaseModel):
     name: str
     aliases: List[str] = Field(default_factory=list)
-    # Allow empty list so you can do brand-only matching if desired
     products: List[Product] = Field(default_factory=list)
 
 
@@ -25,10 +24,10 @@ class ScrapeOptions(BaseModel):
 class PlaywrightOptions(BaseModel):
     """
     Controls specific to JS-rendered pages.
-    These are safe defaults; enable features only when needed.
+    Keep advanced behaviors off unless the target needs them.
     """
 
-    # --- Navigation / waiting ---
+    # Navigation / waiting
     wait_for_selector: Optional[str] = Field(
         default=None,
         description="If set, Playwright will wait for this selector before extracting content (useful for SPAs).",
@@ -40,7 +39,7 @@ class PlaywrightOptions(BaseModel):
         description="Timeout for wait_for_selector.",
     )
 
-    # --- Resource blocking (speed + lower bandwidth) ---
+    # Resource blocking (speed + bandwidth)
     block_images: bool = Field(default=True)
     block_fonts: bool = Field(default=True)
     block_media: bool = Field(default=True)
@@ -49,16 +48,16 @@ class PlaywrightOptions(BaseModel):
         description="Can speed up but may break layout-dependent rendering.",
     )
 
-    # --- Extraction ---
+    # Extraction
     prefer_inner_text: bool = Field(
         default=True,
-        description="If true, tries document.body.innerText (often better for dynamic pages) before HTML parsing fallback.",
+        description="If true, tries document.body.innerText before HTML parsing fallback.",
     )
 
-    # --- Infinite scroll ---
+    # Infinite scroll
     enable_infinite_scroll: bool = Field(
         default=False,
-        description="Enable scrolling to load additional content (feeds, long pages).",
+        description="Scrolls down to load more content on infinite-scroll pages.",
     )
     max_scrolls: int = Field(default=12, ge=0, le=200)
     scroll_pause_ms: int = Field(default=600, ge=0, le=10000)
@@ -66,18 +65,18 @@ class PlaywrightOptions(BaseModel):
         default=2,
         ge=1,
         le=10,
-        description="Stop scrolling after page height doesn't change for this many rounds.",
+        description="Stop scrolling after height doesn't change for this many rounds.",
     )
 
-    # --- Pagination clicking (heuristic) ---
+    # Pagination clicking (heuristic)
     enable_pagination: bool = Field(
         default=False,
-        description="Enable heuristic clicking of Next controls to traverse pagination.",
+        description="Heuristically clicks 'Next' controls to traverse paginated lists.",
     )
     pagination_max_pages: int = Field(default=4, ge=1, le=50)
     next_selectors: List[str] = Field(
         default_factory=list,
-        description="Optional CSS/text selectors tried in order to click 'next'. If empty, built-in defaults are used.",
+        description="Optional selectors tried in order to click 'next'. If empty, built-in defaults are used.",
     )
 
 
@@ -97,12 +96,12 @@ class RetryOptions(BaseModel):
 
 
 class ScrapeRequest(BaseModel):
-    # Seed URLs: keep strict/validated
+    # Seeds
     urls: List[HttpUrl]
     brands: List[Brand]
     options: ScrapeOptions = Field(default_factory=ScrapeOptions)
 
-    # ---- Crawl controls ----
+    # Crawl controls
     crawl_depth: int = Field(
         default=0,
         ge=0,
@@ -113,30 +112,27 @@ class ScrapeRequest(BaseModel):
         default=30,
         ge=1,
         le=2000,
-        description="Max pages to fetch per seed URL (cap to avoid runaway crawls).",
+        description="Max pages to fetch per seed URL.",
     )
     same_domain_only: bool = Field(
         default=True,
         description="Restrict crawling to the same domain as the seed URL.",
     )
 
-    # If empty => follow all internal links (subject to depth/max_pages)
     include_link_keywords: List[str] = Field(
         default_factory=list,
         description="If provided, only follow links whose URL contains any of these keywords.",
     )
-
-    # Optional regex patterns for more control (applied to absolute URL strings)
     include_url_patterns: List[str] = Field(
         default_factory=list,
         description="If provided, only URLs matching at least one regex will be crawled.",
     )
     exclude_url_patterns: List[str] = Field(
         default_factory=list,
-        description="URLs matching any regex will be skipped (e.g. login/cart/pdf).",
+        description="URLs matching any regex will be skipped.",
     )
 
-    # ---- JS rendering controls ----
+    # JS rendering controls
     render_js: bool = Field(
         default=False,
         description="Enable Playwright rendering for JS-heavy pages.",
@@ -153,7 +149,7 @@ class ScrapeRequest(BaseModel):
         default=0,
         ge=0,
         le=30000,
-        description="Extra milliseconds to wait after navigation (helps SPAs hydrate).",
+        description="Extra milliseconds to wait after navigation.",
     )
 
     playwright: PlaywrightOptions = Field(
@@ -166,7 +162,24 @@ class ScrapeRequest(BaseModel):
         description="Retry behavior with exponential backoff.",
     )
 
-    # ---- Performance / politeness ----
+    # Relevance-aware link following
+    link_relevance_mode: Literal["prioritize", "filter"] = Field(
+        default="prioritize",
+        description="prioritize = crawl all but rank relevant links first; filter = only crawl relevant links.",
+    )
+    link_priority_keywords: List[str] = Field(
+        default_factory=lambda: [
+            "treatment", "safety", "hcp", "patient", "patients",
+            "resources", "resource", "education", "faq",
+            "indication", "indications", "dosing", "administration",
+            "adverse", "warnings", "contraindications",
+            "clinical", "trial", "trials", "prescribing", "pi",
+            "mechanism", "moa", "efficacy",
+        ],
+        description="Keywords used to prioritize (or filter) discovered links.",
+    )
+
+    # Performance / politeness
     max_concurrency: int = Field(
         default=2,
         ge=1,
@@ -194,7 +207,7 @@ class ProductMatch(BaseModel):
 
 
 class UrlResult(BaseModel):
-    # Crawled/discovered URLs may fail strict HttpUrl validation; keep as str for robustness
+    # Use str for robustness: crawled URLs may not always validate as strict HttpUrl
     url: str
     status: str
     product_mentions: List[ProductMatch]
