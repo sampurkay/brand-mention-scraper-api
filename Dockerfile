@@ -1,7 +1,7 @@
 # Playwright base image includes Chromium + OS deps
 # [Unverified] Tag availability depends on Playwright release registry; if this tag fails,
-# use the closest available tag (e.g., v1.57.0-jammy) or a newer version.
-FROM mcr.microsoft.com/playwright/python:v1.57.0-jammy
+# use the closest available tag (e.g., v1.58.0-jammy) or a newer version.
+FROM mcr.microsoft.com/playwright/python:v1.58.0-jammy
 
 WORKDIR /app
 
