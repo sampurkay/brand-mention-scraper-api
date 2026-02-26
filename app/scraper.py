@@ -42,6 +42,15 @@ def _normalize_url(url: str) -> str:
     path = p.path or "/"
     return urllib.parse.urlunparse((scheme, netloc, path, "", p.query or "", ""))
 
+def _is_root_like_url(url: str) -> bool:
+    """
+    True for domain roots like:
+    - https://example.com
+    - https://example.com/
+    """
+    p = urllib.parse.urlparse(url)
+    path = (p.path or "").strip()
+    return path in ("", "/")
 
 def _same_domain(a: str, b: str) -> bool:
     return urllib.parse.urlparse(a).netloc.lower() == urllib.parse.urlparse(b).netloc.lower()
@@ -738,8 +747,76 @@ class PoliteScraper:
         pri_kw = [k for k in (link_priority_keywords or []) if (k or "").strip()]
 
         visited: Set[str] = set()
-        queue: Deque[Tuple[str, int]] = deque([(start_url, 0)])
         results: List[Tuple[str, str, str, str]] = []
+
+        # --- NEW: seed expansion for root URLs ---
+        seed_urls: List[str] = [start_url]
+
+        # Expand only when seed is root-like.
+        # This helps when depth=0 (root pages often contain no relevant text).
+        if _is_root_like_url(start_url):
+            try:
+                # One fetch of the root + link extraction (uses your existing rules)
+                st0, txt0, links0, _title0 = await self.fetch_with_links(
+                    start_url,
+                    render_js=render_js,
+                    js_only=js_only,
+                    wait_until=wait_until,
+                    wait_ms=wait_ms,
+                    same_domain_only=same_domain_only,
+                    respect_robots=respect_robots,
+                    pw=pw,
+                    retry=rt,
+                )
+
+                # Only expand if we got usable links and the root wasn't hard-blocked
+                if st0.startswith("ok") and links0:
+                    # Apply the same allow rules you already use
+                    candidate_links: List[str] = []
+                    for lnk in links0:
+                        lnk_n = _normalize_url(lnk)
+                        if not self._url_allowed(
+                            lnk_n,
+                            same_domain_only=same_domain_only,
+                            start_url=start_url,
+                            include_patterns=include_patterns,
+                            exclude_patterns=exclude_patterns,
+                        ):
+                            continue
+                        candidate_links.append(lnk_n)
+
+                    # Apply include_link_keywords (optional filter)
+                    if include_keywords:
+                        low_keywords = [k.lower() for k in include_keywords]
+                        candidate_links = [
+                            u for u in candidate_links
+                            if any(k in u.lower() for k in low_keywords)
+                        ]
+
+                    # Apply relevance mode (optional)
+                    if pri_kw:
+                        scored = [( _relevance_score(u, pri_kw), u) for u in candidate_links]
+                        if link_relevance_mode == "filter":
+                            scored = [(s, u) for (s, u) in scored if s > 0]
+                        scored.sort(key=lambda x: x[0], reverse=True)
+                        candidate_links = [u for (_s, u) in scored]
+
+                    # Hard cap to prevent explosion on large nav menus
+                    # (tune this number; 80–200 is typical)
+                    cap = min(200, max_pages)
+                    candidate_links = candidate_links[:cap]
+
+                    # Final seed list: root first, then inner pages
+                    seed_urls = [start_url] + candidate_links
+
+            except Exception:
+                # If expansion fails, just fall back to start_url only
+                seed_urls = [start_url]
+
+        # Build initial queue.
+        # IMPORTANT: enqueue expanded seeds at depth 0 so they are scraped even when depth=0.
+        queue: Deque[Tuple[str, int]] = deque((u, 0) for u in seed_urls)
+        # --- END seed expansion ---
 
         sem = asyncio.Semaphore(max(1, int(max_concurrency)))
 
